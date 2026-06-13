@@ -40,9 +40,12 @@ type ResponseObserver func(*http.Response)
 // New builds the proxy http.Handler.
 //
 // baseURL must be a fully qualified upstream URL (e.g.
-// "https://api.anthropic.com"). apiKey is forwarded as the x-api-key
-// header on every request. observer, if non-nil, is invoked once per
-// upstream response for header-only inspection (see ResponseObserver).
+// "https://api.anthropic.com"). The auth scheme is chosen from the
+// credential class: an OAuth token (prefix sk-ant-oat) is sent as
+// "Authorization: Bearer <token>" with the oauth-2025-04-20 beta flag,
+// while any other key is sent as the x-api-key header. observer, if
+// non-nil, is invoked once per upstream response for header-only
+// inspection (see ResponseObserver).
 func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error) {
 	upstream, err := url.Parse(baseURL)
 	if err != nil {
@@ -57,14 +60,27 @@ func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error
 	// the same job inline — re-derive scheme/host/path from the
 	// configured upstream so a malicious inbound Host header cannot
 	// redirect traffic, and stamp the auth header from the gateway's
-	// own config so client-supplied x-api-key is replaced.
+	// own config so any client-supplied credential is replaced.
 	basePath := strings.TrimRight(upstream.Path, "/")
+	oauth := isOAuthToken(apiKey)
+	// Trim once for the Bearer value so the same whitespace tolerance
+	// that classifies the token doesn't leak into the header.
+	bearer := "Bearer " + strings.TrimSpace(apiKey)
 	rp.Director = func(r *http.Request) {
 		r.URL.Scheme = upstream.Scheme
 		r.URL.Host = upstream.Host
 		r.Host = upstream.Host
 		r.URL.Path = joinPath(basePath, r.URL.Path)
-		r.Header.Set("x-api-key", apiKey)
+		if oauth {
+			// OAuth tokens authenticate over Bearer, not x-api-key.
+			// Drop any client-supplied x-api-key so the two schemes
+			// don't collide, and ensure the oauth beta flag is set.
+			r.Header.Del("x-api-key")
+			r.Header.Set("Authorization", bearer)
+			ensureBeta(r.Header, oauthBeta)
+		} else {
+			r.Header.Set("x-api-key", apiKey)
+		}
 	}
 
 	// ModifyResponse runs after headers are received but before the
@@ -125,4 +141,35 @@ func joinPath(basePath, requestPath string) string {
 	default:
 		return base + "/" + req
 	}
+}
+
+// oauthBeta is the anthropic-beta opt-in Anthropic requires for OAuth
+// (Claude Code subscription) tokens. Without it, a Bearer-authenticated
+// request is rejected.
+const oauthBeta = "oauth-2025-04-20"
+
+// isOAuthToken reports whether key is a Claude Code OAuth token rather
+// than a plain API key. OAuth tokens use the stable sk-ant-oat prefix
+// and must be sent as a Bearer credential; API keys (sk-ant-api…) use
+// the x-api-key header.
+func isOAuthToken(key string) bool {
+	return strings.HasPrefix(strings.TrimSpace(key), "sk-ant-oat")
+}
+
+// ensureBeta adds value to the comma-separated anthropic-beta header if
+// it is not already present, preserving any client-supplied flags. The
+// header is the documented place for opt-in features, and Anthropic
+// tolerates multiple values; we dedup only to keep the header tidy.
+func ensureBeta(h http.Header, value string) {
+	existing := h.Get("anthropic-beta")
+	if existing == "" {
+		h.Set("anthropic-beta", value)
+		return
+	}
+	for _, v := range strings.Split(existing, ",") {
+		if strings.TrimSpace(v) == value {
+			return
+		}
+	}
+	h.Set("anthropic-beta", existing+","+value)
 }

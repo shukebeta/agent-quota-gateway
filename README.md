@@ -53,6 +53,12 @@ ANTHROPIC_API_KEY=sk-ant-... \
   ./agent-quota-gateway
 ```
 
+`ANTHROPIC_API_KEY` accepts either a Claude Code OAuth token
+(`sk-ant-oat…`) or a plain API key (`sk-ant-api…`); the gateway picks
+the matching auth scheme automatically. Metering quota on OAuth tokens
+is the gateway's primary use — those carry the rate limits worth
+watching.
+
 The gateway listens on `127.0.0.1:8080` by default. Point Claude Code
 at it:
 
@@ -70,7 +76,7 @@ gateway supplies the real key. Any non-empty placeholder is fine.
 | Variable              | Default                       | Notes                                                |
 |-----------------------|-------------------------------|------------------------------------------------------|
 | `ANTHROPIC_BASE_URL`  | `https://api.anthropic.com`   | Upstream base URL; scheme and host are required.     |
-| `ANTHROPIC_API_KEY`   | _(required)_                  | Forwarded as `x-api-key` on every request.           |
+| `ANTHROPIC_API_KEY`   | _(required)_                  | Upstream credential. An OAuth token (`sk-ant-oat…`) is sent as `Authorization: Bearer` with the `oauth-2025-04-20` beta flag; any other key is sent as `x-api-key`. |
 | `LISTEN_ADDR`         | `127.0.0.1:8080`              | Loopback address only; the V1 build refuses anything else. |
 
 ## Smoke test
