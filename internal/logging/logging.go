@@ -29,11 +29,11 @@ func Middleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 
 		entry := map[string]any{
-			"ts":        time.Now().UTC().Format(time.RFC3339Nano),
-			"method":    r.Method,
-			"path":      r.URL.Path,
-			"status":    rw.status,
-			"duration":  time.Since(start).String(),
+			"ts":         time.Now().UTC().Format(time.RFC3339Nano),
+			"method":     r.Method,
+			"path":       r.URL.Path,
+			"status":     rw.status,
+			"duration":   time.Since(start).String(),
 			"request_id": requestID(r),
 		}
 		// Marshal errors are impossible with the field set above, but

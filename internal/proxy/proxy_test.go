@@ -13,10 +13,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 )
 
-// newGateway spins up a fake upstream plus a proxy that targets it.
+// injectBackend wraps a handler so every request arrives with b on its
+// context, standing in for the resolver middleware the real gateway runs
+// in front of the proxy.
+func injectBackend(b backend.Backend, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(backend.WithBackend(r.Context(), b)))
+	})
+}
+
+// newGateway spins up a fake upstream plus a proxy that targets it,
+// fronted by a backend that carries an API-key credential ("test-api-key"
+// is not an sk-ant-oat token, so the proxy uses the x-api-key scheme).
 // The fake upstream records the headers it saw, returns a configurable
 // response, and (for the streaming test) flushes each chunk on a delay.
 func newGateway(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *httptest.Server) {
@@ -24,11 +36,11 @@ func newGateway(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
-	gw, err := proxy.New(upstream.URL, "test-api-key", nil)
+	gw, err := proxy.New(upstream.URL, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	gwSrv := httptest.NewServer(gw)
+	gwSrv := httptest.NewServer(injectBackend(backend.Backend{Nick: "default", Credential: "test-api-key"}, gw))
 	t.Cleanup(gwSrv.Close)
 	return gwSrv, upstream
 }
@@ -300,19 +312,20 @@ func TestProxy_observerFiresWithResponse(t *testing.T) {
 		calls.Add(1)
 		seenHeader = resp.Header.Get("anthropic-ratelimit-tokens-remaining")
 		if resp.Request != nil {
-			seenBackend = resp.Request.Header.Get("X-Mux-Backend-Nick")
+			if b, ok := backend.FromContext(resp.Request.Context()); ok {
+				seenBackend = b.Nick
+			}
 		}
 	}
 
-	gw, err := proxy.New(upSrv.URL, "test-api-key", observer)
+	gw, err := proxy.New(upSrv.URL, observer)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	gwSrv := httptest.NewServer(gw)
+	gwSrv := httptest.NewServer(injectBackend(backend.Backend{Nick: "mybackend", Credential: "test-api-key"}, gw))
 	t.Cleanup(gwSrv.Close)
 
 	req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/messages", strings.NewReader("{}"))
-	req.Header.Set("X-Mux-Backend-Nick", "mybackend")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("do: %v", err)
@@ -326,7 +339,7 @@ func TestProxy_observerFiresWithResponse(t *testing.T) {
 		t.Errorf("observer saw anthropic-ratelimit-tokens-remaining = %q, want 42", seenHeader)
 	}
 	if seenBackend != "mybackend" {
-		t.Errorf("observer saw X-Mux-Backend-Nick = %q, want mybackend (custom headers must survive to ModifyResponse)", seenBackend)
+		t.Errorf("observer saw backend nick = %q, want mybackend (resolved backend must reach ModifyResponse via context)", seenBackend)
 	}
 }
 
@@ -344,11 +357,11 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	t.Cleanup(upSrv.Close)
 
 	var calls atomic.Int32
-	gw, err := proxy.New(upSrv.URL, "test-api-key", func(*http.Response) { calls.Add(1) })
+	gw, err := proxy.New(upSrv.URL, func(*http.Response) { calls.Add(1) })
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	gwSrv := httptest.NewServer(gw)
+	gwSrv := httptest.NewServer(injectBackend(backend.Backend{Nick: "default", Credential: "test-api-key"}, gw))
 	t.Cleanup(gwSrv.Close)
 
 	resp, err := http.Get(gwSrv.URL + "/v1/messages")
@@ -367,16 +380,17 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 const oauthBetaValue = "oauth-2025-04-20"
 
 // newGatewayWithKey is like newGateway but lets the test choose the
-// configured credential so OAuth vs API-key auth can be exercised.
+// backend credential so OAuth vs API-key auth can be exercised.
 func newGatewayWithKey(t *testing.T, key string, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
-	gw, err := proxy.New(upstream.URL, key, nil)
+	gw, err := proxy.New(upstream.URL, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
+	gw = injectBackend(backend.Backend{Nick: "test", Credential: key}, gw)
 	gwSrv := httptest.NewServer(gw)
 	t.Cleanup(gwSrv.Close)
 	return gwSrv

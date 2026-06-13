@@ -13,22 +13,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
-// defaultBackendKey is the cache key used when an inbound request does
-// not set X-Mux-Backend-Nick. Documented in the README so single-tenant
-// callers that never set the header can still read snapshots back.
+// defaultBackendKey is the quota cache key used as a defensive fallback
+// if a forwarded response somehow lacks a resolved backend on its
+// context. In normal operation the resolver middleware guarantees one.
 const defaultBackendKey = "default"
-
-// backendHeader is the inbound header that names the backend a request
-// is bound for. It is a plain custom header (not on the hop-by-hop
-// list), so httputil.ReverseProxy preserves it on resp.Request inside
-// ModifyResponse.
-const backendHeader = "X-Mux-Backend-Nick"
 
 func main() {
 	if err := run(); err != nil {
@@ -43,12 +38,18 @@ func run() error {
 		return fmt.Errorf("config: %w", err)
 	}
 
+	registry, err := backend.Load()
+	if err != nil {
+		return fmt.Errorf("backend: %w", err)
+	}
+
 	store := quota.NewStore()
 
 	// observer is invoked once per upstream response, before the proxy
 	// streams the body back to the client. It extracts the rate-limit
-	// headers and files the snapshot under the backend the inbound
-	// request named. Header-only inspection — no body access.
+	// headers and files the snapshot under the backend the resolver
+	// middleware selected for the request. Header-only inspection — no
+	// body access.
 	//
 	// We only store snapshots that actually carry quota data. An
 	// upstream response with no rate-limit headers (e.g. a 5xx page,
@@ -62,26 +63,27 @@ func run() error {
 		}
 		key := defaultBackendKey
 		if resp.Request != nil {
-			if v := resp.Request.Header.Get(backendHeader); v != "" {
-				key = v
+			if b, ok := backend.FromContext(resp.Request.Context()); ok {
+				key = b.Nick
 			}
 		}
 		store.Put(key, snap)
 	}
 
-	proxyHandler, err := proxy.New(cfg.AnthropicBaseURL, cfg.AnthropicAPIKey, observer)
+	proxyHandler, err := proxy.New(cfg.AnthropicBaseURL, observer)
 	if err != nil {
 		return fmt.Errorf("proxy: %w", err)
 	}
 
 	// The proxy owns the catch-all so every non-gateway path forwards
 	// to the upstream (the upstream is the authority on what it serves).
-	// The quota endpoint is mounted on a gateway-specific prefix so it
-	// cannot collide with anything the upstream Messages surface defines.
+	// The resolver middleware sits in front of it so every forwarded
+	// request carries a resolved backend; the gateway's own /_gateway
+	// endpoints are mounted directly and take no selector.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store))
-	mux.Handle("/", proxyHandler)
+	mux.Handle("/", backend.Middleware(registry, proxyHandler))
 
 	handler := logging.Middleware(mux)
 
@@ -152,9 +154,9 @@ func healthHandler() http.HandlerFunc {
 // quotaHandler returns the JSON snapshot for the requested backend.
 //
 // Method is GET only — POSTing here would suggest the endpoint mutates
-// state, which it does not. The backend key defaults to defaultBackendKey
-// so single-tenant clients that never set X-Mux-Backend-Nick can still
-// read the snapshot back with a plain `curl /_gateway/quota`. Unknown
+// state, which it does not. The backend nick comes from the `?backend=`
+// query param and defaults to defaultBackendKey, so a plain `curl
+// /_gateway/quota` reads the default snapshot back. Unknown
 // keys return 200 with an empty snapshot (just backend + as_of) — the
 // distinction the caller cares about ("did I get quota data?") is
 // answered by which fields are present in the JSON body, not by the
