@@ -154,9 +154,9 @@ func healthHandler() http.HandlerFunc {
 // quotaHandler returns the JSON snapshot for the requested backend.
 //
 // Method is GET only — POSTing here would suggest the endpoint mutates
-// state, which it does not. The backend key defaults to defaultBackendKey
-// so single-tenant clients that never set X-Mux-Backend-Nick can still
-// read the snapshot back with a plain `curl /_gateway/quota`. Unknown
+// state, which it does not. The backend nick comes from the `?backend=`
+// query param and defaults to defaultBackendKey, so a plain `curl
+// /_gateway/quota` reads the default snapshot back. Unknown
 // keys return 200 with an empty snapshot (just backend + as_of) — the
 // distinction the caller cares about ("did I get quota data?") is
 // answered by which fields are present in the JSON body, not by the

@@ -55,9 +55,8 @@ const (
 // JSON consumers can distinguish "header missing" (field absent) from a
 // real 0.0 (window untouched — full quota available).
 type Snapshot struct {
-	// Backend is the cache key the snapshot was filed under. It is the
-	// value of X-Mux-Backend-Nick on the inbound request, or "default"
-	// when that header was empty.
+	// Backend is the cache key the snapshot was filed under: the nick of
+	// the backend the request resolved to, or "default" as a fallback.
 	Backend string `json:"backend"`
 
 	// UnifiedStatus is the overall allow/reject decision; UnifiedReset
@@ -92,9 +91,9 @@ type Snapshot struct {
 //
 // The returned Snapshot's Backend field is left empty — Extract does
 // not know which key the caller intends to file the snapshot under.
-// The wiring in main.go derives the key from X-Mux-Backend-Nick before
-// calling Store.Put. Headers that are absent or unparseable yield nil
-// fields; we never invent zero values for missing data.
+// The wiring in main.go derives the key from the resolved backend nick
+// before calling Store.Put. Headers that are absent or unparseable
+// yield nil fields; we never invent zero values for missing data.
 func Extract(resp *http.Response) Snapshot {
 	s := Snapshot{AsOf: time.Now().UTC()}
 	if resp == nil {
