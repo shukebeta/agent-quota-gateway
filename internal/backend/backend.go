@@ -295,6 +295,14 @@ func (r *Registry) ResolveIn(poolName, nick string) (Backend, bool) {
 	return b, ok
 }
 
+// NormalizeName canonicalizes a selector the same way the loader
+// canonicalizes a pool name, so HTTP-boundary callers that resolve a
+// selector (the resolver middleware, the quota endpoint) match the
+// configured pool regardless of case or `_`/`-` spelling.
+func NormalizeName(raw string) string {
+	return normalizeName(raw)
+}
+
 // normalizeName canonicalizes a pool name or nick: lowercase, with
 // underscores folded to hyphens (so AQG_POOL_Z_AI is addressed as
 // "z-ai"), and surrounding hyphens trimmed. The same normalization is

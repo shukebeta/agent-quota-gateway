@@ -405,6 +405,20 @@ func TestQuotaHandler_poolViewAddsActiveBackend(t *testing.T) {
 	if got["unified_5h_utilization"] != 0.42 {
 		t.Errorf("unified_5h_utilization=%v, want 0.42", got["unified_5h_utilization"])
 	}
+
+	// The pool query is case-insensitive, matching the routing path.
+	upper, err := http.Get(srv.URL + "/_gateway/quota?backend=AUTO")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer upper.Body.Close()
+	var gotUpper map[string]any
+	if err := json.NewDecoder(upper.Body).Decode(&gotUpper); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if gotUpper["active_backend"] != "acct-one" {
+		t.Errorf("?backend=AUTO active_backend=%v, want acct-one (case-insensitive)", gotUpper["active_backend"])
+	}
 }
 
 // TestQuotaHandler_unknownPoolEmptySnapshot proves an unknown pool (or a

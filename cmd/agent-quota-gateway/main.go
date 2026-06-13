@@ -190,7 +190,9 @@ func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		key := r.URL.Query().Get("backend")
+		// Normalize the pool name the same way the routing path does, so a
+		// diagnostic query like ?backend=AUTO matches pool "auto".
+		key := backend.NormalizeName(r.URL.Query().Get("backend"))
 		w.Header().Set("Content-Type", "application/json")
 		if pools != nil {
 			if b, ok := pools.Current(key); ok {
