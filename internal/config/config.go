@@ -21,7 +21,9 @@ const (
 	EnvAnthropicBaseURL = "ANTHROPIC_BASE_URL"
 
 	// EnvAnthropicAPIKey is the credential used to authenticate against
-	// the upstream. Required when serving real traffic.
+	// the upstream. Required when serving real traffic. Accepts either
+	// an OAuth token (sk-ant-oat…, sent as Bearer) or an API key
+	// (sk-ant-api…, sent as x-api-key).
 	EnvAnthropicAPIKey = "ANTHROPIC_API_KEY"
 
 	// EnvListenAddr is the loopback address the proxy binds to.
@@ -42,8 +44,10 @@ type Config struct {
 	// to. The path is appended at request time.
 	AnthropicBaseURL string
 
-	// AnthropicAPIKey is forwarded as x-api-key on every request. Empty
-	// is allowed for tests that point at a fake upstream; production
+	// AnthropicAPIKey is the upstream credential. Its class decides the
+	// auth scheme the proxy uses: an OAuth token (sk-ant-oat…) is sent
+	// as a Bearer credential, any other key as x-api-key. Empty is
+	// allowed for tests that point at a fake upstream; production
 	// callers must set it.
 	AnthropicAPIKey string
 

@@ -361,3 +361,112 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 		t.Errorf("observer call count = %d, want 0 (rejected requests must not invoke observer)", got)
 	}
 }
+
+// oauthBetaValue mirrors the proxy's internal oauthBeta constant; the
+// external test package can't reach the unexported one.
+const oauthBetaValue = "oauth-2025-04-20"
+
+// newGatewayWithKey is like newGateway but lets the test choose the
+// configured credential so OAuth vs API-key auth can be exercised.
+func newGatewayWithKey(t *testing.T, key string, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	upstream := httptest.NewServer(handler)
+	t.Cleanup(upstream.Close)
+
+	gw, err := proxy.New(upstream.URL, key, nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	gwSrv := httptest.NewServer(gw)
+	t.Cleanup(gwSrv.Close)
+	return gwSrv
+}
+
+func TestProxy_oauthTokenUsesBearer(t *testing.T) {
+	const token = "sk-ant-oat01-secret-token"
+	var gotAuth, gotKey, gotBeta string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotKey = r.Header.Get("x-api-key")
+		gotBeta = r.Header.Get("anthropic-beta")
+		w.WriteHeader(http.StatusOK)
+	})
+	gw := newGatewayWithKey(t, token, upstream)
+
+	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("req: %v", err)
+	}
+	// A client placeholder x-api-key must be dropped, not forwarded.
+	req.Header.Set("x-api-key", "client-placeholder")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotAuth != "Bearer "+token {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer "+token)
+	}
+	if gotKey != "" {
+		t.Errorf("x-api-key = %q, want empty (OAuth tokens must not be sent as x-api-key)", gotKey)
+	}
+	if gotBeta != oauthBetaValue {
+		t.Errorf("anthropic-beta = %q, want %q", gotBeta, oauthBetaValue)
+	}
+}
+
+func TestProxy_oauthTokenPreservesClientBeta(t *testing.T) {
+	const token = "sk-ant-oat01-secret-token"
+	var gotBeta string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBeta = r.Header.Get("anthropic-beta")
+		w.WriteHeader(http.StatusOK)
+	})
+	gw := newGatewayWithKey(t, token, upstream)
+
+	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("req: %v", err)
+	}
+	req.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	want := "prompt-caching-2024-07-31," + oauthBetaValue
+	if gotBeta != want {
+		t.Errorf("anthropic-beta = %q, want %q (client beta preserved, oauth flag appended once)", gotBeta, want)
+	}
+}
+
+func TestProxy_oauthTokenDoesNotDuplicateBeta(t *testing.T) {
+	const token = "sk-ant-oat01-secret-token"
+	var gotBeta string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBeta = r.Header.Get("anthropic-beta")
+		w.WriteHeader(http.StatusOK)
+	})
+	gw := newGatewayWithKey(t, token, upstream)
+
+	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("req: %v", err)
+	}
+	// Client already sent the oauth flag; it must not be duplicated.
+	req.Header.Set("anthropic-beta", oauthBetaValue)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotBeta != oauthBetaValue {
+		t.Errorf("anthropic-beta = %q, want %q (no duplication)", gotBeta, oauthBetaValue)
+	}
+}
