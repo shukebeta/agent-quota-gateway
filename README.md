@@ -115,9 +115,10 @@ guarantees that follow from that:
 - Request and response bodies are not logged, persisted, or inspected.
   The logging middleware records only `method`, `path`, `status`,
   `duration`, and a request ID.
-- Credential headers (`Authorization`, `x-api-key`) are stripped from
-  inbound requests before the upstream call and are never written to
-  stderr.
+- The client-supplied `x-api-key` is replaced with the configured key
+  before the upstream call; all other headers forwarded to the
+  upstream are otherwise untouched. No credential-sensitive field is
+  written to stderr.
 - Quota snapshots are stored only in process memory. There is no on-
   disk state and no telemetry egress; stopping the gateway erases the
   cache.
