@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
@@ -56,8 +57,13 @@ func TestIntegration_fullStack(t *testing.T) {
 
 	// Fake upstream: streams three SSE events with rate-limit headers,
 	// flushing between each so a buffered proxy would take the full
-	// stream duration to surface the first event.
+	// stream duration to surface the first event. It also records the
+	// credential headers it received so the test can prove the gateway
+	// swapped in the backend's real credential and dropped the selector.
+	var gotUpstreamKey, gotUpstreamAuth string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUpstreamKey = r.Header.Get("x-api-key")
+		gotUpstreamAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("anthropic-version", "2023-06-01")
 		w.Header().Set("anthropic-ratelimit-unified-status", "allowed")
@@ -80,9 +86,16 @@ func TestIntegration_fullStack(t *testing.T) {
 	upSrv := httptest.NewServer(upstream)
 	t.Cleanup(upSrv.Close)
 
-	// Rebuild the wiring `run()` produces, minus the real config.Load
-	// (which reads the environment) and the signal-driven shutdown
-	// path (httptest.Server handles cleanup).
+	// Rebuild the wiring `run()` produces, minus the signal-driven
+	// shutdown path (httptest.Server handles cleanup). The backend
+	// "test-backend" owns the real upstream credential; the client only
+	// ever sends its nick as a selector.
+	t.Setenv("AQG_BACKEND_TEST_BACKEND", "real-upstream-credential")
+	registry, err := backend.Load()
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+
 	store := quota.NewStore()
 	observer := func(resp *http.Response) {
 		snap := quota.Extract(resp)
@@ -91,13 +104,13 @@ func TestIntegration_fullStack(t *testing.T) {
 		}
 		key := defaultBackendKey
 		if resp.Request != nil {
-			if v := resp.Request.Header.Get(backendHeader); v != "" {
-				key = v
+			if b, ok := backend.FromContext(resp.Request.Context()); ok {
+				key = b.Nick
 			}
 		}
 		store.Put(key, snap)
 	}
-	proxyHandler, err := proxy.New(upSrv.URL, "test-api-key", observer)
+	proxyHandler, err := proxy.New(upSrv.URL, observer)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
@@ -105,21 +118,23 @@ func TestIntegration_fullStack(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store))
-	mux.Handle("/", proxyHandler)
+	mux.Handle("/", backend.Middleware(registry, proxyHandler))
 
 	handler := logging.Middleware(mux)
 	gw := httptest.NewServer(handler)
 	t.Cleanup(gw.Close)
 
-	// 1. Streaming passthrough.
+	// 1. Streaming passthrough. The client names the backend by putting
+	// its nick in the bearer token (where Claude Code puts
+	// ANTHROPIC_AUTH_TOKEN) and sends a stray x-api-key the gateway must
+	// drop.
 	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader(`{"secret":"prompt-body-should-not-leak"}`))
 	if err != nil {
 		t.Fatalf("req: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", "client-supplied-attacker-key")
-	req.Header.Set("Authorization", "Bearer secret-token-should-not-leak")
-	req.Header.Set("X-Mux-Backend-Nick", "test-backend")
+	req.Header.Set("Authorization", "Bearer test-backend")
 
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -151,8 +166,18 @@ func TestIntegration_fullStack(t *testing.T) {
 		t.Errorf("first event arrived at %v; proxy appears to buffer (want < 150ms)", firstAt)
 	}
 
-	// 2. Quota snapshot readable via /_gateway/quota with the backend
-	// key the request named.
+	// 1b. The gateway must have swapped in the backend's real credential
+	// (an API key here → x-api-key) and dropped the inbound selector that
+	// arrived on Authorization.
+	if gotUpstreamKey != "real-upstream-credential" {
+		t.Errorf("upstream x-api-key = %q, want real-upstream-credential", gotUpstreamKey)
+	}
+	if gotUpstreamAuth != "" {
+		t.Errorf("upstream Authorization = %q, want empty (selector must not reach upstream)", gotUpstreamAuth)
+	}
+
+	// 2. Quota snapshot readable via /_gateway/quota under the resolved
+	// backend nick.
 	quotaResp, err := http.Get(gw.URL + "/_gateway/quota?backend=test-backend")
 	if err != nil {
 		t.Fatalf("quota get: %v", err)
@@ -214,7 +239,7 @@ func TestIntegration_fullStack(t *testing.T) {
 	for _, banned := range []string{
 		"prompt-body-should-not-leak",
 		"client-supplied-attacker-key",
-		"secret-token-should-not-leak",
+		"real-upstream-credential",
 	} {
 		if strings.Contains(logs, banned) {
 			t.Errorf("stderr leaked %q\nlogs: %s", banned, logs)

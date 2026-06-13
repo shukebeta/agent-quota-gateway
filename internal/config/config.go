@@ -1,13 +1,13 @@
 // Package config loads gateway configuration from environment variables.
 //
-// The gateway is intentionally minimal: it reads three values from the
-// environment, validates them, and exposes them through a single struct.
-// Anything more elaborate (flag parsing, config files, hot reload) is out
-// of scope for V1.
+// The gateway is intentionally minimal: it reads the upstream URL and
+// listen address from the environment, validates them, and exposes them
+// through a single struct. Upstream credentials are not config — they
+// live in the backend registry (see package backend). Anything more
+// elaborate (flag parsing, config files, hot reload) is out of scope.
 package config
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -20,14 +20,8 @@ const (
 	// Default is the production endpoint; tests may override it.
 	EnvAnthropicBaseURL = "ANTHROPIC_BASE_URL"
 
-	// EnvAnthropicAPIKey is the credential used to authenticate against
-	// the upstream. Required when serving real traffic. Accepts either
-	// an OAuth token (sk-ant-oat…, sent as Bearer) or an API key
-	// (sk-ant-api…, sent as x-api-key).
-	EnvAnthropicAPIKey = "ANTHROPIC_API_KEY"
-
 	// EnvListenAddr is the loopback address the proxy binds to.
-	// Default is 127.0.0.1:8080; intentionally loopback-only for V1.
+	// Default is 127.0.0.1:8080; intentionally loopback-only.
 	EnvListenAddr = "LISTEN_ADDR"
 
 	// DefaultBaseURL is the Anthropic production endpoint.
@@ -44,26 +38,18 @@ type Config struct {
 	// to. The path is appended at request time.
 	AnthropicBaseURL string
 
-	// AnthropicAPIKey is the upstream credential. Its class decides the
-	// auth scheme the proxy uses: an OAuth token (sk-ant-oat…) is sent
-	// as a Bearer credential, any other key as x-api-key. Empty is
-	// allowed for tests that point at a fake upstream; production
-	// callers must set it.
-	AnthropicAPIKey string
-
 	// ListenAddr is the loopback address the gateway binds to.
 	ListenAddr string
 }
 
 // Load reads the gateway configuration from the process environment.
 //
-// Returns an error if any required value is missing or malformed. The
-// Anthropic API key is required so a misconfigured deployment fails fast
-// at startup rather than silently dropping auth on the first request.
+// Returns an error if any value is malformed so a misconfigured
+// deployment fails fast at startup. Credentials are loaded separately by
+// the backend registry.
 func Load() (Config, error) {
 	cfg := Config{
 		AnthropicBaseURL: getEnv(EnvAnthropicBaseURL, DefaultBaseURL),
-		AnthropicAPIKey:  os.Getenv(EnvAnthropicAPIKey),
 		ListenAddr:       getEnv(EnvListenAddr, DefaultListenAddr),
 	}
 
@@ -73,13 +59,9 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// validate enforces the V1 contract: non-empty API key, an upstream URL
-// with a scheme and host, and a loopback listen address. Future versions
-// may relax these.
+// validate enforces the contract: an upstream URL with a scheme and
+// host, and a loopback listen address.
 func (c Config) validate() error {
-	if strings.TrimSpace(c.AnthropicAPIKey) == "" {
-		return errors.New("ANTHROPIC_API_KEY is required")
-	}
 	upstream, err := url.Parse(c.AnthropicBaseURL)
 	if err != nil {
 		return fmt.Errorf("ANTHROPIC_BASE_URL is invalid: %w", err)
@@ -93,12 +75,12 @@ func (c Config) validate() error {
 	return nil
 }
 
-// validateListenAddr enforces the loopback-only constraint for V1:
-// the host part of LISTEN_ADDR must be a literal loopback address
-// (127.0.0.1, ::1) or the loopback name "localhost". We accept the
-// name because it is the conventional shortcut and resolves to a
-// loopback IP, but we reject 0.0.0.0 and any routable address —
-// exposing the proxy off-loopback would put the API key on the wire.
+// validateListenAddr enforces the loopback-only constraint: the host
+// part of LISTEN_ADDR must be a literal loopback address (127.0.0.1,
+// ::1) or the loopback name "localhost". We accept the name because it
+// is the conventional shortcut and resolves to a loopback IP, but we
+// reject 0.0.0.0 and any routable address — exposing the proxy
+// off-loopback would put backend credentials on the wire.
 func validateListenAddr(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {

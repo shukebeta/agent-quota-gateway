@@ -8,11 +8,17 @@ local Claude Code workflows.
 A single-binary Go server that listens on `127.0.0.1` and forwards
 any `POST` to `https://api.anthropic.com` (Claude Code uses
 `/v1/messages` and `/v1/messages/count_tokens`), preserving streaming
-and the `anthropic-*` headers Claude Code sends. The gateway owns the
-`ANTHROPIC_API_KEY` so client processes never see the upstream
-credential directly.
+and the `anthropic-*` headers Claude Code sends.
 
-## V1 scope
+The gateway owns one or more named **backends**, each a real upstream
+credential. A client never sends a real token — it sends a *selector*
+(via `ANTHROPIC_AUTH_TOKEN`, which Claude Code puts on the
+`Authorization` header), and the gateway swaps in the selected
+backend's credential before forwarding. This lets one local user route
+across several authorized Claude subscriptions / OAuth identities from a
+single gateway without any client ever seeing a credential.
+
+## Scope
 
 - Anthropic-only. No OpenAI / Google / other providers.
 - POST-only. Any path is forwarded to the upstream — the upstream is
@@ -27,13 +33,19 @@ credential directly.
 - One log line per request (method, path, status, duration, request
   ID). Request bodies, response bodies, and credential headers are
   never logged.
+- Selector-based routing. The inbound `ANTHROPIC_AUTH_TOKEN` is a local
+  backend selector, never forwarded upstream. Unknown or missing
+  selectors fail closed with `403` — there is no silent fallback to
+  another account.
 - Quota snapshots are captured passively from upstream rate-limit
-  headers and exposed at `GET /_gateway/quota`. No synthetic probe
-  requests — freshness depends on real client traffic.
+  headers and exposed at `GET /_gateway/quota`, keyed per backend. No
+  synthetic probe requests — freshness depends on real client traffic.
 
-Out of scope for V1:
+Out of scope:
 
 - Non-Anthropic providers
+- `auto` / quota- or concurrency-aware scheduling across backends
+  (a selector always names one explicit backend)
 - TLS termination (front it with a reverse proxy or `stunnel` if
   you need it)
 - Request/response body modification, caching, retries
@@ -49,53 +61,69 @@ Out of scope for V1:
 ```bash
 go build -o agent-quota-gateway ./cmd/agent-quota-gateway
 
-ANTHROPIC_API_KEY=sk-ant-... \
+# Declare one or more backends; the suffix after AQG_BACKEND_ is the nick.
+AQG_BACKEND_CLAUDE_A=sk-ant-oat... \
+AQG_BACKEND_CLAUDE_B=sk-ant-oat... \
   ./agent-quota-gateway
 ```
 
-`ANTHROPIC_API_KEY` accepts either a Claude Code OAuth token
-(`sk-ant-oat…`) or a plain API key (`sk-ant-api…`); the gateway picks
-the matching auth scheme automatically. Metering quota on OAuth tokens
-is the gateway's primary use — those carry the rate limits worth
-watching.
+Each backend credential may be a Claude Code OAuth token (`sk-ant-oat…`,
+sent upstream as `Authorization: Bearer`) or a plain API key
+(`sk-ant-api…`, sent as `x-api-key`); the gateway picks the matching
+scheme per backend. Metering quota on OAuth tokens is the primary use —
+those carry the limits worth watching.
 
-The gateway listens on `127.0.0.1:8080` by default. Point Claude Code
-at it:
+The gateway listens on `127.0.0.1:8080` by default. Point Claude Code at
+it and select a backend by putting its nick in `ANTHROPIC_AUTH_TOKEN`:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
-ANTHROPIC_API_KEY=any-non-empty-value \
+ANTHROPIC_AUTH_TOKEN=claude-a \
 claude
 ```
 
-Claude Code requires the env var to be present even though the
-gateway supplies the real key. Any non-empty placeholder is fine.
+The nick replaces what used to be a real token — the consumer side
+changes only its *value*, not its wiring. The env-key suffix is
+normalized to the selector: `AQG_BACKEND_CLAUDE_A` is addressed as
+`claude-a` (lowercase, `_`→`-`).
 
 ## Environment variables
 
-| Variable              | Default                       | Notes                                                |
-|-----------------------|-------------------------------|------------------------------------------------------|
-| `ANTHROPIC_BASE_URL`  | `https://api.anthropic.com`   | Upstream base URL; scheme and host are required.     |
-| `ANTHROPIC_API_KEY`   | _(required)_                  | Upstream credential. An OAuth token (`sk-ant-oat…`) is sent as `Authorization: Bearer` with the `oauth-2025-04-20` beta flag; any other key is sent as `x-api-key`. |
-| `LISTEN_ADDR`         | `127.0.0.1:8080`              | Loopback address only; the V1 build refuses anything else. |
+| Variable                | Default                       | Notes                                                |
+|-------------------------|-------------------------------|------------------------------------------------------|
+| `AQG_BACKEND_<NICK>`    | _(at least one required)_     | A backend credential. The suffix is normalized to the selector nick (`AQG_BACKEND_CLAUDE_A` → `claude-a`). An OAuth token (`sk-ant-oat…`) is sent upstream as `Authorization: Bearer` with the `oauth-2025-04-20` beta flag; any other value as `x-api-key`. Startup fails if none are set, a credential is empty, or two keys collide on the same nick. |
+| `ANTHROPIC_BASE_URL`    | `https://api.anthropic.com`   | Upstream base URL; scheme and host are required.     |
+| `LISTEN_ADDR`           | `127.0.0.1:8080`              | Loopback address only; the build refuses anything else. |
+
+Backends live in the environment, not a file — the gateway never reads a
+credential from disk (see [Security model](#security-model)). If you
+prefer to keep them in a `.env`, source it into the environment before
+launch (`set -a; . ./.env; set +a`) or use systemd `EnvironmentFile=` /
+a secret manager; the gateway still only reads its environment.
 
 ## Smoke test
 
-With the gateway running on `127.0.0.1:8080`:
+With the gateway running on `127.0.0.1:8080` and a backend declared as
+`AQG_BACKEND_CLAUDE_A=…`, select it with a bearer token equal to the
+nick:
 
 ```bash
 curl -N -X POST http://127.0.0.1:8080/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
+  -H 'Authorization: Bearer claude-a' \
   -d '{"model":"claude-haiku-4-5-20251001","max_tokens":16,"messages":[{"role":"user","content":"say hi"}]}'
 ```
 
 You should see streaming SSE events back. The `-N` flag is required so
-`curl` does not buffer the response itself.
+`curl` does not buffer the response itself. An unknown or missing
+selector returns `403 {"error":"unknown backend selector"}` without any
+upstream round-trip.
 
 ## Layout
 
 - `cmd/agent-quota-gateway/` — service entrypoint and integration tests
+- `internal/backend/` — backend registry, selector resolution middleware
 - `internal/config/` — env loading and validation
 - `internal/proxy/` — reverse-proxy handler and tests
 - `internal/quota/` — rate-limit header extraction and snapshot store
@@ -118,16 +146,23 @@ The trust boundary is the loopback interface. Everything that can reach
 run alongside a single user account without authentication. The
 guarantees that follow from that:
 
-- The gateway owns the API key. Clients never see it — they may set
-  any placeholder in `ANTHROPIC_API_KEY` and the proxy replaces it
-  with the configured value on every outbound request.
+- The gateway owns every backend credential. Clients never see one —
+  they send a selector (`ANTHROPIC_AUTH_TOKEN` → `Authorization:
+  Bearer <nick>`), and the proxy replaces it with the resolved
+  backend's real credential on every outbound request. The selector is
+  never forwarded upstream and never logged or echoed — a client that
+  mistakenly put a real token in `ANTHROPIC_AUTH_TOKEN` does not leak
+  it through a rejection.
+- Unknown or missing selectors fail closed with `403` before any
+  upstream round-trip. There is no silent fallback to a default account.
 - Request and response bodies are not logged, persisted, or inspected.
   The logging middleware records only `method`, `path`, `status`,
   `duration`, and a request ID.
-- The client-supplied `x-api-key` is replaced with the configured key
-  before the upstream call; all other headers forwarded to the
-  upstream are otherwise untouched. No credential-sensitive field is
-  written to stderr.
+- Credentials live only in the process environment and in memory —
+  the gateway reads no credential file, so its "no on-disk state"
+  posture holds. How the environment is populated (shell, systemd
+  `EnvironmentFile=`, a secret manager) is the operator's choice and
+  the operator's responsibility to protect.
 - Quota snapshots are stored only in process memory. There is no on-
   disk state and no telemetry egress; stopping the gateway erases the
   cache.
@@ -147,7 +182,7 @@ request and keeps the latest snapshot per backend key in an
 in-process cache. Reads go through a small loopback endpoint:
 
 ```bash
-curl http://127.0.0.1:8080/_gateway/quota?backend=mybackend
+curl http://127.0.0.1:8080/_gateway/quota?backend=claude-a
 ```
 
 The unified scheme is what subscription / OAuth (Claude Code) tokens
@@ -163,7 +198,7 @@ when the upstream response did not carry the corresponding header):
 
 ```json
 {
-  "backend": "mybackend",
+  "backend": "claude-a",
   "unified_status": "allowed",
   "unified_reset": "2026-06-13T13:30:00Z",
   "unified_representative_claim": "five_hour",
@@ -189,18 +224,20 @@ last response did not advertise that window at all.
 
 ### Backend keying
 
-Clients identify the backend a request is bound for by setting the
-`X-Mux-Backend-Nick` header on the inbound request. The proxy
-forwards it to Anthropic untouched, and the observer files the
-response snapshot under that key. When the header is absent or
-empty, the snapshot is filed under `default` and `GET
-/_gateway/quota` (no query) returns it.
+Snapshots are filed under the nick of the backend the request resolved
+to — the same nick the client put in `ANTHROPIC_AUTH_TOKEN`. Read a
+backend's snapshot by naming it:
 
-`GET /_gateway/quota?backend=unknown` always returns 200; if no
-traffic for that key has been seen, the body is just `{"backend":
-"unknown", "as_of": "..."}`. Use the presence of a `unified_*` field
-(e.g. `unified_5h_utilization`) to decide whether quota data is
-actually available.
+```bash
+curl http://127.0.0.1:8080/_gateway/quota?backend=claude-a
+```
+
+`GET /_gateway/quota?backend=unknown` always returns 200; if no traffic
+for that nick has been seen, the body is just `{"backend": "unknown",
+"as_of": "..."}`. Use the presence of a `unified_*` field (e.g.
+`unified_5h_utilization`) to decide whether quota data is actually
+available. (The endpoint takes no selector itself — it is a local
+read-only view, gated by the loopback boundary like `/_gateway/health`.)
 
 ### Freshness model
 
@@ -231,8 +268,9 @@ they observe rather than rely on a frozen schema. This means:
 
 ## Why a thin proxy
 
-The proxy is the trust boundary — it owns the API key, and its
-logs are safe to share with any local tool. Quota observation
-piggy-backs on the same boundary: rate-limit headers come down on
-every response, so we capture them with zero extra upstream load.
-See [Security model](#security-model) for the full list of guarantees.
+The proxy is the trust boundary — it owns the backend credentials and
+resolves a selector to one per request, and its logs are safe to share
+with any local tool. Quota observation piggy-backs on the same
+boundary: rate-limit headers come down on every response, so we capture
+them per backend with zero extra upstream load. See
+[Security model](#security-model) for the full list of guarantees.

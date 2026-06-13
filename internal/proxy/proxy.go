@@ -20,6 +20,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 )
 
 // allowedMethods is the HTTP method set the proxy forwards. Anthropic's
@@ -40,13 +42,16 @@ type ResponseObserver func(*http.Response)
 // New builds the proxy http.Handler.
 //
 // baseURL must be a fully qualified upstream URL (e.g.
-// "https://api.anthropic.com"). The auth scheme is chosen from the
-// credential class: an OAuth token (prefix sk-ant-oat) is sent as
+// "https://api.anthropic.com"). The credential is not configured here:
+// it is resolved per request from the backend that the resolver
+// middleware stored on the request context, so one proxy serves every
+// configured backend. The auth scheme is chosen from that credential's
+// class — an OAuth token (prefix sk-ant-oat) is sent as
 // "Authorization: Bearer <token>" with the oauth-2025-04-20 beta flag,
 // while any other key is sent as the x-api-key header. observer, if
 // non-nil, is invoked once per upstream response for header-only
 // inspection (see ResponseObserver).
-func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error) {
+func New(baseURL string, observer ResponseObserver) (http.Handler, error) {
 	upstream, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -59,27 +64,37 @@ func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error
 	// joins paths in a way that makes the dataflow hard to audit. We do
 	// the same job inline — re-derive scheme/host/path from the
 	// configured upstream so a malicious inbound Host header cannot
-	// redirect traffic, and stamp the auth header from the gateway's
-	// own config so any client-supplied credential is replaced.
+	// redirect traffic, and stamp the credential of the resolved backend
+	// so the inbound selector is always replaced before it goes upstream.
 	basePath := strings.TrimRight(upstream.Path, "/")
-	oauth := isOAuthToken(apiKey)
-	// Trim once for the Bearer value so the same whitespace tolerance
-	// that classifies the token doesn't leak into the header.
-	bearer := "Bearer " + strings.TrimSpace(apiKey)
 	rp.Director = func(r *http.Request) {
 		r.URL.Scheme = upstream.Scheme
 		r.URL.Host = upstream.Host
 		r.Host = upstream.Host
 		r.URL.Path = joinPath(basePath, r.URL.Path)
-		if oauth {
-			// OAuth tokens authenticate over Bearer, not x-api-key.
-			// Drop any client-supplied x-api-key so the two schemes
-			// don't collide, and ensure the oauth beta flag is set.
+
+		b, ok := backend.FromContext(r.Context())
+		if !ok {
+			// The resolver middleware guarantees a backend before the
+			// proxy runs; if it is somehow absent, fail safe by
+			// stripping every inbound credential so neither the selector
+			// nor a stray client key reaches the upstream.
+			r.Header.Del("Authorization")
 			r.Header.Del("x-api-key")
-			r.Header.Set("Authorization", bearer)
+			return
+		}
+
+		cred := strings.TrimSpace(b.Credential)
+		if isOAuthToken(cred) {
+			// OAuth tokens authenticate over Bearer, not x-api-key.
+			r.Header.Del("x-api-key")
+			r.Header.Set("Authorization", "Bearer "+cred)
 			ensureBeta(r.Header, oauthBeta)
 		} else {
-			r.Header.Set("x-api-key", apiKey)
+			// API keys use x-api-key; drop the inbound selector that
+			// arrived on Authorization so it never goes upstream.
+			r.Header.Del("Authorization")
+			r.Header.Set("x-api-key", cred)
 		}
 	}
 
