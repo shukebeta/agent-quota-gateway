@@ -384,16 +384,23 @@ func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 }
 
 // storeExhaustedUntilLocked reports nick's window reset when the quota store
-// shows it fully consumed (utilization at or above the threshold) with a
-// reset still in the future. ok is false when the store has no usable signal
-// — no store, no snapshot, utilization below threshold, or a missing/past
-// reset. This is how a backend that signals exhaustion through the poller
-// (z.ai / MiniMaxi) or rate-limit headers (Anthropic) rather than a clean
-// proxy-path 429 still drives failover. Requiring a future reset also makes
-// a stale frozen entry (the poller only tracks the active member, so a
-// failed-off member's snapshot freezes at its reset) read healthy once that
-// reset passes, without a re-poll. Caller holds c.mu; the store has its own
-// lock and never calls back into the controller.
+// shows a unified window fully consumed (utilization at or above the
+// threshold) with a reset still in the future. It considers BOTH the 5h and
+// 7d windows: each contributes only when its own utilization is at the cap
+// and its own reset is ahead, and when both qualify the later reset wins, so
+// the returned time is always anchored to the window that actually flagged
+// the member — never the 7d reset for a 5h-only exhaustion or vice versa.
+// Checking 7d matters for poller-tracked backends (z.ai / MiniMaxi), which
+// report a weekly cap through the dashboard API and emit no clean
+// proxy-path 429 to catch a 7d-exhausted-but-5h-healthy member the reactive
+// way.
+//
+// ok is false when no window qualifies — no store, no snapshot, every
+// utilization below threshold, or a missing/past reset. Requiring a future
+// reset also makes a stale frozen entry (the poller only tracks the active
+// member, so a failed-off member's snapshot freezes at its reset) read
+// healthy once that reset passes, without a re-poll. Caller holds c.mu; the
+// store has its own lock and never calls back into the controller.
 func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 	if c.store == nil {
 		return time.Time{}, false
@@ -403,13 +410,25 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	snap := c.store.Get(c.backendAt(idx).QuotaKey())
-	if snap.Unified5hUtilization == nil || *snap.Unified5hUtilization < exhaustionUtilizationThreshold {
-		return time.Time{}, false
+	reset, ok := time.Time{}, false
+	for _, w := range [...]struct {
+		util  *float64
+		reset *time.Time
+	}{
+		{snap.Unified5hUtilization, snap.Unified5hReset},
+		{snap.Unified7dUtilization, snap.Unified7dReset},
+	} {
+		if w.util == nil || *w.util < exhaustionUtilizationThreshold {
+			continue
+		}
+		if w.reset == nil || !c.now().Before(*w.reset) {
+			continue
+		}
+		if !ok || w.reset.After(reset) {
+			reset, ok = *w.reset, true
+		}
 	}
-	if snap.Unified5hReset == nil || !c.now().Before(*snap.Unified5hReset) {
-		return time.Time{}, false
-	}
-	return *snap.Unified5hReset, true
+	return reset, ok
 }
 
 // firstHealthyLocked finds the backend to fail over to. For a priority
