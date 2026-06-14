@@ -8,7 +8,10 @@ local Claude Code workflows.
 A single-binary Go server that listens on `127.0.0.1` and forwards any
 `POST` to an Anthropic-compatible upstream (Claude Code uses
 `/v1/messages` and `/v1/messages/count_tokens`), preserving streaming and
-the `anthropic-*` headers Claude Code sends.
+the `anthropic-*` headers Claude Code sends. For multiple machines that
+share one set of pool credentials, an opt-in
+[shared mode](#shared-mode-over-tailscale) binds a Tailscale address so
+they ride one authoritative instance.
 
 The gateway owns one or more named **pools**. A pool is a set of
 *interchangeable* backends — same protocol, same quota semantics — each
@@ -71,7 +74,10 @@ Out of scope:
 - Request/response body modification, caching, retries.
 - Quota history or per-request metering — only the latest snapshot per
   backend is kept.
-- Authentication on `/_gateway/*` — loopback is the trust boundary.
+- Authentication on `/_gateway/*` — loopback is the trust boundary (in
+  [shared mode](#shared-mode-over-tailscale) the Tailscale ACL is, and the
+  `/_gateway/quota` view becomes readable by every permitted tailnet
+  member).
 - Docker image or other packaging — `go build` is the deliverable.
 
 ## Quickstart
@@ -192,14 +198,17 @@ never preempt, so their prompt cache is never interrupted.
 | `AQG_POOL_<POOL>_BASE_URL` | `ANTHROPIC_BASE_URL` | The pool's default upstream; scheme and host are required. Omit it for pools that hit `api.anthropic.com`. |
 | `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest priority first (e.g. `zai,m3`). When set, the pool starts on and fails over toward the highest-priority healthy member instead of random/round-robin. Unlisted members rank last (sorted). Carries no credential. See [Priority within a pool](#priority-within-a-pool). |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
-| `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only; the build refuses anything else. |
+| `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
+| `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
-`AQG_POOL_*` shape, two keys colliding on the same pool/member, or a
+`AQG_POOL_*` shape, two keys colliding on the same pool/member, a
 `PRIORITY` that is empty, repeats a nick, names a nick that is not a member
-of the pool, or targets a pool with no members. A `|` in a credential is
-rejected because the tail must parse as a URL — tokens do not contain `|`.
+of the pool, or targets a pool with no members, both `LISTEN_ADDR` and
+`SHARED_LISTEN_ADDR` set at once, or a `SHARED_LISTEN_ADDR` outside the
+Tailscale ranges. A `|` in a credential is rejected because the tail must
+parse as a URL — tokens do not contain `|`.
 
 Pools live in the environment, not a file — the gateway never reads a
 credential from disk (see [Security model](#security-model)). If you
@@ -329,10 +338,12 @@ any local process as legitimate.
 
 ## Security model
 
-The trust boundary is the loopback interface. Everything that can reach
-`127.0.0.1:8080` is considered authorised, so the gateway is safe to run
-alongside a single user account without authentication. The guarantees
-that follow:
+In the default mode the trust boundary is the loopback interface.
+Everything that can reach `127.0.0.1:8080` is considered authorised, so the
+gateway is safe to run alongside a single user account without
+authentication. ([Shared mode](#shared-mode-over-tailscale) moves that
+boundary to a Tailscale ACL — see that section for the changed model.) The
+guarantees that follow:
 
 - The gateway owns every credential. Clients never see one — they send a
   pool name (`ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer <pool>`), and
@@ -358,9 +369,120 @@ that follow:
   Z.ai / ZhipuAI and MiniMaxi quota endpoints, sent with the active
   member's own credential to that member's own provider — never to
   Anthropic, and never carrying request/response bodies.
-- The listen address is loopback-only. `config.validate` rejects
-  `0.0.0.0`, public IPs, and unresolvable names so a misconfigured
-  deployment fails closed at startup.
+- The listen address is loopback-only by default. `config.validate`
+  rejects `0.0.0.0`, public IPs, and unresolvable names so a misconfigured
+  deployment fails closed at startup. The one sanctioned way off loopback
+  is [shared mode](#shared-mode-over-tailscale), which accepts only
+  Tailscale addresses and nothing else.
+
+## Shared mode over Tailscale
+
+By default the gateway is single-machine: it binds loopback and only local
+clients reach it. If several machines **intentionally share the same pool
+credentials** and want one authoritative view — one sticky pointer, one
+failover decision, one quota snapshot across all of them — run a single
+gateway instance and let the others reach it over a [Tailscale](https://tailscale.com)
+overlay.
+
+Set `SHARED_LISTEN_ADDR` to this device's Tailscale IP (leave `LISTEN_ADDR`
+unset — the two are mutually exclusive):
+
+```bash
+SHARED_LISTEN_ADDR=100.101.102.103:8080 \
+AQG_POOL_AUTO_BACKEND_A=sk-ant-oat... \
+AQG_POOL_AUTO_BACKEND_B=sk-ant-oat... \
+  ./agent-quota-gateway
+```
+
+Other tailnet machines then point Claude Code at that address (the
+Tailscale IP or its MagicDNS name):
+
+```bash
+ANTHROPIC_BASE_URL=http://100.101.102.103:8080 \
+ANTHROPIC_AUTH_TOKEN=auto \
+claude
+```
+
+One socket serves both the tailnet and the gateway host itself (a
+Tailscale IP is a local interface), so there is no separate loopback
+listener — a local client on the gateway box uses the same Tailscale
+address.
+
+### What "shared" means
+
+This is not a new coordination protocol. The sticky pointer, exhausted
+marks, and quota snapshots have always lived **per process**; shared mode
+simply makes that one process reachable from other machines. So by
+definition:
+
+- every client drives the **same** sticky member, so the prompt cache on
+  the active account keeps paying off across all of them;
+- a `429` one machine triggers fails the pool over for **everyone** at
+  once — no machine has to independently hit the wall to learn a backend
+  is drained;
+- `GET /_gateway/quota` returns the one shared view, not a per-machine
+  guess.
+
+There is **no per-client fairness or quota partitioning**. The shared 5h
+window is first-come: one busy machine can drain it and the others simply
+observe the drained state (which is the point — they see the truth). Switch
+logs name the member (`auto[auto]: a -> b`) but not which machine drove the
+switch.
+
+> Running several **separate** gateway instances against the same
+> credentials is **not** an authoritative coordination model. Each instance
+> keeps its own sticky pointer, exhausted marks, and quota snapshots, so
+> they diverge until each independently draws a `429`. Reactive failover
+> still converges each instance to a correct state on its own, but there is
+> no shared view. Use one instance in shared mode if you want that.
+
+### The Tailscale ACL is required, not optional
+
+The gateway adds **no authentication of its own** — the identity layer is
+the Tailscale overlay. But Tailscale's default ACL is *allow-all*: without
+an explicit ACL, any tailnet member can reach the gateway port and drive
+your pools (and read `/_gateway/quota`). An ACL restricting the port to
+specific tags is a **required** part of running shared mode. Tag the
+gateway host and the clients, and allow only the client tag to the port:
+
+```jsonc
+{
+  "tagOwners": {
+    "tag:aqg-gateway": ["autogroup:admin"],
+    "tag:aqg-client":  ["autogroup:admin"],
+  },
+  "acls": [
+    // Only aqg clients may reach the gateway port; nothing else on the
+    // tailnet can. Everything not matched here is denied by this ACL.
+    {
+      "action": "accept",
+      "src":    ["tag:aqg-client"],
+      "dst":    ["tag:aqg-gateway:8080"],
+    },
+  ],
+}
+```
+
+Apply the gateway tag to the host running the binary
+(`tailscale up --advertise-tags=tag:aqg-gateway`) and the client tag to the
+consuming machines.
+
+### Blast radius
+
+The gateway **holds credentials and never hands them out** — a client that
+reaches the socket gets *use* of a pool (it can drive the gateway to call
+Anthropic), never the credential itself. That bounds the worst case:
+
+- a **subscription** (`sk-ant-oat…`) pool caps at a drained 5h window,
+  which recovers on reset;
+- an `sk-ant-api…` (pay-as-you-go) pool caps at **dollar spend**, which
+  does not recover.
+
+The gateway does not distinguish pool credential types, which is exactly
+why the address boundary is uniform — the Tailscale overlay, not "trust the
+LAN for subscription pools." Bare-LAN (RFC1918) and public listen addresses
+are rejected for this reason: there is no "the LAN is trusted" middle
+ground.
 
 ## Quota snapshots
 

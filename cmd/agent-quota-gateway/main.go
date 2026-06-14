@@ -137,6 +137,13 @@ func run() error {
 		errCh <- nil
 	}()
 
+	if cfg.Shared {
+		// Shared mode is off-loopback: every tailnet member that can reach
+		// this port can drive the pools and read /_gateway/quota. The
+		// gateway adds no auth — the Tailscale ACL is the only gate — so
+		// make the exposure loud rather than let it pass as a normal start.
+		fmt.Fprintf(os.Stderr, "agent-quota-gateway: SHARED MODE — bound to Tailscale address %s, reachable by tailnet members. A Tailscale ACL restricting this port is REQUIRED; the gateway adds no authentication of its own.\n", cfg.ListenAddr)
+	}
 	fmt.Fprintf(os.Stderr, "agent-quota-gateway listening on %s; default upstream %s; pools %s\n", cfg.ListenAddr, cfg.AnthropicBaseURL, strings.Join(registry.PoolNames(), ", "))
 
 	select {
