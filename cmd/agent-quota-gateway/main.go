@@ -119,6 +119,14 @@ func run() error {
 	qp := poller.New(registry.PoolNames(), pools.Current, store, nil, 0, nil, nil)
 	go qp.Run(ctx)
 
+	// The preemptor returns a priority pool to a higher-priority member once
+	// that member's quota window resets, so a freshly-reset preferred backend
+	// is drained promptly instead of riding the active fallback until it 429s.
+	// It only touches pools that declared AQG_POOL_<POOL>_PRIORITY and returns
+	// immediately when none did. It shares the shutdown context.
+	pre := auto.NewPreemptor(pools, store, 0, nil, nil)
+	go pre.Run(ctx)
+
 	errCh := make(chan error, 1)
 	go func() {
 		err := srv.ListenAndServe()
