@@ -32,6 +32,14 @@ ENV
 	echo ">> created ${ENV_FILE} (template) — edit it, then: sudo systemctl restart ${BIN}"
 else
 	echo ">> kept existing ${ENV_FILE}"
+	# A common footgun: pointing the unit at a sourced shell env file.
+	# systemd's EnvironmentFile is not a shell — it ignores `export `-prefixed
+	# lines (logging their values to the journal) and does not expand $VAR.
+	if grep -qE '^[[:space:]]*export ' "${ENV_FILE}" 2>/dev/null; then
+		echo ">> WARNING: ${ENV_FILE} contains 'export '-prefixed lines."
+		echo "   systemd will NOT parse them (and logs their values to the journal)."
+		echo "   Use bare KEY=value lines with resolved values; see deploy/aqg.env.example."
+	fi
 fi
 
 systemctl daemon-reload

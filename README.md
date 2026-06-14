@@ -518,6 +518,13 @@ See [`deploy/aqg.env.example`](deploy/aqg.env.example) for the full
 template. `SHARED_LISTEN_ADDR` should be the host's Tailscale IP
 (`tailscale ip -4`); omit it to run loopback-only instead.
 
+> This file is a systemd `EnvironmentFile`, **not** a shell script. Use
+> bare `KEY=value` lines — **no `export` prefix** (systemd ignores
+> `export …` lines *and* logs their values to the journal as "invalid
+> assignment", leaking secrets in plaintext). Give the service its own
+> file with only its variables; do not point the unit at a general
+> secrets dump.
+
 **Upgrading** is the same command — `scripts/deploy.sh <host>` again. It
 rebuilds, re-ships, and restarts; the env file is left untouched. Confirm
 what is running:
