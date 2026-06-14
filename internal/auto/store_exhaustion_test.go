@@ -10,9 +10,9 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
-// putUtil files a snapshot reporting nick fully (or partially) consumed in
-// the store, mirroring what the poller writes for a z.ai / MiniMaxi member
-// or what the header observer writes for Anthropic.
+// putUtil files a snapshot reporting nick's 5h window fully (or partially)
+// consumed in the store, mirroring what the poller writes for a z.ai /
+// MiniMaxi member or what the header observer writes for Anthropic.
 func putUtil(t *testing.T, store *quota.Store, c *Controller, nick string, util float64, reset time.Time) {
 	t.Helper()
 	store.Put(c.resolve(t, nick).QuotaKey(), quota.Snapshot{
@@ -20,6 +20,27 @@ func putUtil(t *testing.T, store *quota.Store, c *Controller, nick string, util 
 		Unified5hReset:       &reset,
 		AsOf:                 reset.Add(-time.Hour),
 	})
+}
+
+// putUtil7d files a snapshot reporting nick's 7d (weekly) window consumed,
+// the 5h window untouched — the shape a poller-tracked backend hits when its
+// weekly cap binds before its short window.
+func putUtil7d(t *testing.T, store *quota.Store, c *Controller, nick string, util float64, reset time.Time) {
+	t.Helper()
+	store.Put(c.resolve(t, nick).QuotaKey(), quota.Snapshot{
+		Unified7dUtilization: &util,
+		Unified7dReset:       &reset,
+		AsOf:                 reset.Add(-time.Hour),
+	})
+}
+
+// exhaustedUntil is a test-only locked wrapper over exhaustedUntilLocked so
+// the merge of the live-429 park and the store signal can be asserted
+// directly.
+func (c *Controller) exhaustedUntil(nick string) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exhaustedUntilLocked(nick)
 }
 
 // newPriorityControllerWithStore builds a priority-pool controller wired to
@@ -152,5 +173,63 @@ func TestStoreExhaustion_priorityFailsOffAndPreemptsBack(t *testing.T) {
 	p.tick()
 	if got := c.Current(); got != "zai" {
 		t.Errorf("Current()=%q, want zai (preempted back after window reset)", got)
+	}
+}
+
+// TestResolveAuto_failsOffOn7dStoreExhaustion proves the 7d (weekly) window
+// drives failover too: a member whose 5h window is healthy but whose 7d cap
+// is spent is failed off, with the wait anchored to the 7d reset. Before
+// this, only the 5h window was checked, so a 7d-exhausted poller-tracked
+// member (which emits no clean proxy-path 429) was never failed off.
+func TestResolveAuto_failsOffOn7dStoreExhaustion(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard) // sticky on a
+
+	putUtil7d(t, store, c, "a", 1.0, clock.now().Add(48*time.Hour)) // weekly cap spent; 5h untouched
+
+	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "b" {
+		t.Errorf("ResolveAuto picked %q exhausted=%v, want b / false (a is 7d-exhausted)", b.Nick, exhausted)
+	}
+}
+
+// TestExhaustedUntil_mergesLiveParkAndStore proves the unified signal returns
+// the later of the live-429 park and the store window, regardless of which is
+// later — so a member is never re-selected while either signal still blocks
+// it, and the resets stay anchored to their own windows.
+func TestExhaustedUntil_mergesLiveParkAndStore(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	parkAt := clock.now().Add(time.Hour)      // live 429 park (representative reset)
+	storeAt := clock.now().Add(3 * time.Hour) // store 5h reset, later
+	c.park("a", parkAt)
+	putUtil(t, store, c, "a", 1.0, storeAt)
+
+	if got, ok := c.exhaustedUntil("a"); !ok || !got.Equal(storeAt) {
+		t.Errorf("exhaustedUntil = %v,%v, want %v,true (store reset is later)", got, ok, storeAt)
+	}
+
+	// Reverse: a later live park wins over an earlier store reset.
+	c.park("a", clock.now().Add(5*time.Hour))
+	wantPark := clock.now().Add(5 * time.Hour)
+	if got, ok := c.exhaustedUntil("a"); !ok || !got.Equal(wantPark) {
+		t.Errorf("exhaustedUntil = %v,%v, want %v,true (live park is later)", got, ok, wantPark)
+	}
+}
+
+// TestStoreExhausted_pastResetOn7dNotExhausted mirrors the 5h frozen-entry
+// case for the 7d window: a 100%-consumed weekly window whose reset already
+// passed reads healthy without a re-poll.
+func TestStoreExhausted_pastResetOn7dNotExhausted(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	putUtil7d(t, store, c, "a", 1.0, clock.now().Add(-time.Minute)) // weekly reset already passed
+
+	if b, _, _ := c.ResolveAuto(); b.Nick != "a" {
+		t.Errorf("ResolveAuto picked %q, want a (7d window already reset)", b.Nick)
 	}
 }
