@@ -172,11 +172,17 @@ The order is by member nick only — no vendor or model names appear in the
 gateway's routing logic, so adding a new vendor's subscription is a config
 change, never a code change.
 
-Phase 1 (this release) honours priority for the **initial pick** and the
-**failover target** only. Once a pool falls over to a lower-priority member
-it rides that member until the member itself `429`s — it does not yet
-preempt back when the preferred backend's quota window resets (tracked
-separately).
+A priority pool also **preempts back**: when a higher-priority member's
+quota window resets while a lower-priority member is active, the gateway
+switches the pool back to the recovered member so a freshly-reset preferred
+backend is drained promptly instead of riding the fallback until it `429`s.
+The switch happens within one timer cycle of the reset. It uses the precise
+`unified_5h_reset` when known (Anthropic via headers, other vendors via the
+quota poller), falls back to the member's parked reset otherwise, and only
+idles on a 5-minute poll when neither is available. A member that resets but
+is immediately rate-limited again is not switched to repeatedly — reactive
+`429` failover keeps precedence. Pools **without** a `PRIORITY` declaration
+never preempt, so their prompt cache is never interrupted.
 
 ## Environment variables
 
