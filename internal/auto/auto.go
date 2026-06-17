@@ -60,6 +60,20 @@ const exhaustionUtilizationThreshold = 1.0
 // immediately and rebuild its cache on the new backend.
 const switchRetryAfterSeconds = 1
 
+// window5h and window7d are the lengths of the Anthropic unified
+// rate-limit windows. They are used by the lead calculation:
+//
+//	elapsed_fraction = 1 - (time_until_reset / window_length)
+//	lead = utilization - elapsed_fraction
+//
+// A positive lead means the member is consuming faster than its window
+// is depleting and should be cooled down; near-zero is on pace; negative
+// is under pace.
+const (
+	window5h = 5 * time.Hour
+	window7d = 7 * 24 * time.Hour
+)
+
 // Pools fronts each configured pool with its own Controller and routes a
 // request to the right one. It implements backend.PoolRouter.
 type Pools struct {
@@ -149,6 +163,14 @@ type MemberStatus struct {
 	Status         string          `json:"status"`          // "active", "exhausted", "idle"
 	ExhaustedUntil *time.Time      `json:"exhausted_until"` // RFC 3339 or null
 	Snapshot       *quota.Snapshot `json:"snapshot"`        // null when no snapshot recorded
+
+	// Lead fields are populated only for pools in balanced mode.
+	// Lead is max(Lead5h, Lead7d) over known windows; null when no data.
+	// Lead5h and Lead7d are null when the corresponding window has no data.
+	// A positive lead means the member is consuming ahead of schedule.
+	Lead   *float64 `json:"lead,omitempty"`
+	Lead5h *float64 `json:"lead_5h,omitempty"`
+	Lead7d *float64 `json:"lead_7d,omitempty"`
 }
 
 // PoolStatus is the /_gateway/pool response for one pool.
@@ -184,8 +206,9 @@ func (p *Pools) AllPoolStatuses(store *quota.Store) []PoolStatus {
 // PoolPersistState is the serializable routing state for one pool.
 // It is exported so the persist package can embed it in GatewayState.
 type PoolPersistState struct {
-	Sticky    string               `json:"sticky"`
-	Exhausted map[string]time.Time `json:"exhausted"`
+	Sticky            string               `json:"sticky"`
+	Exhausted         map[string]time.Time `json:"exhausted"`
+	LastBalanceSwitch time.Time            `json:"last_balance_switch,omitempty"`
 }
 
 // LoadPersistState applies previously persisted routing state to each pool's
@@ -193,7 +216,7 @@ type PoolPersistState struct {
 func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	for name, s := range states {
 		if c, ok := p.byPool[name]; ok {
-			c.loadState(s.Sticky, s.Exhausted)
+			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch)
 		}
 	}
 }
@@ -254,6 +277,17 @@ type Controller struct {
 	// onMutate, if non-nil, is called (non-blocking) after any mutation to
 	// cur or exhausted. Set by Pools.SetOnMutate to notify the persister.
 	onMutate func()
+
+	// balanceGap is the minimum lead difference (active minus candidate)
+	// that triggers a balance switch. 0 means balance mode is off for this
+	// pool; populated from AQG_POOL_<POOL>_BALANCE_GAP (default 0.15).
+	balanceGap float64
+	// balanceDwell is the minimum time between balance switches. Populated
+	// from AQG_POOL_<POOL>_BALANCE_DWELL (default 5m).
+	balanceDwell time.Duration
+	// lastBalanceSwitch records the most recent balance switch time for
+	// dwell enforcement. Zero when no balance switch has occurred.
+	lastBalanceSwitch time.Time
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -271,14 +305,16 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 	}
 	nicks := reg.PoolNicks(poolName) // sorted; Load guarantees at least one per pool
 	c := &Controller{
-		reg:       reg,
-		pool:      poolName,
-		nicks:     nicks,
-		priority:  effectiveOrder(reg.PoolPriority(poolName), nicks),
-		store:     store,
-		exhausted: make(map[string]time.Time),
-		now:       now,
-		logOut:    logOut,
+		reg:          reg,
+		pool:         poolName,
+		nicks:        nicks,
+		priority:     effectiveOrder(reg.PoolPriority(poolName), nicks),
+		store:        store,
+		exhausted:    make(map[string]time.Time),
+		now:          now,
+		logOut:       logOut,
+		balanceGap:   reg.PoolBalanceGap(poolName),
+		balanceDwell: reg.PoolBalanceDwell(poolName),
 	}
 	n := len(nicks)
 	if n == 0 {
@@ -347,6 +383,15 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	c.clearExpiredLocked()
 
 	if !c.isExhaustedLocked(c.nicks[c.cur]) {
+		if c.balanceGap > 0 {
+			if idx, ok := c.balanceSwitchLocked(); ok {
+				from := c.nicks[c.cur]
+				c.cur = idx
+				c.lastBalanceSwitch = c.now()
+				c.notifyMutate()
+				fmt.Fprintf(c.logOut, "auto[%s]: balance %s -> %s (lead gap)\n", c.pool, from, c.nicks[idx])
+			}
+		}
 		return c.backendAt(c.cur), 0, false
 	}
 	if idx, ok := c.firstHealthyLocked(); ok {
@@ -435,6 +480,21 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 				ms.Snapshot = &snapCopy
 			}
 		}
+		if c.balanceGap > 0 {
+			overall, l5h, l7d, has5h, has7d := c.memberLeadsLocked(nick)
+			if has5h || has7d {
+				ov := overall
+				ms.Lead = &ov
+			}
+			if has5h {
+				v := l5h
+				ms.Lead5h = &v
+			}
+			if has7d {
+				v := l7d
+				ms.Lead7d = &v
+			}
+		}
 		members = append(members, ms)
 	}
 	return PoolStatus{Pool: c.pool, Active: curNick, Members: members}
@@ -444,7 +504,7 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 // has already passed are silently dropped. Persisted nicks absent from the
 // current pool membership are logged and skipped. Called once at startup
 // before the server begins serving; does not call onMutate.
-func (c *Controller) loadState(sticky string, exhausted map[string]time.Time) {
+func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lastBalanceSwitch time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if idx := c.indexOf(sticky); idx >= 0 {
@@ -469,6 +529,9 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time) {
 		}
 		c.exhausted[nick] = reset
 	}
+	if c.balanceDwell > 0 && !lastBalanceSwitch.IsZero() {
+		c.lastBalanceSwitch = lastBalanceSwitch
+	}
 }
 
 // persistState snapshots the controller's routing state for serialisation.
@@ -479,7 +542,11 @@ func (c *Controller) persistState() PoolPersistState {
 	for k, v := range c.exhausted {
 		ex[k] = v
 	}
-	return PoolPersistState{Sticky: c.nicks[c.cur], Exhausted: ex}
+	return PoolPersistState{
+		Sticky:            c.nicks[c.cur],
+		Exhausted:         ex,
+		LastBalanceSwitch: c.lastBalanceSwitch,
+	}
 }
 
 // ModifyResponse is the per-pool failover hook. It acts on a request that
@@ -673,6 +740,84 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 		}
 	}
 	return reset, ok
+}
+
+// memberLeadsLocked computes the routing pressure for nick from the quota
+// store. It returns per-window leads (utilization minus elapsed window
+// fraction, clamped elapsed to [0,1]) and the overall max lead. has5h and
+// has7d are true when the corresponding window had enough data (non-nil
+// utilization, non-nil reset, reset still in the future). When neither
+// window has data all returned floats are 0 and both has flags are false.
+// Caller holds c.mu; the store has its own lock.
+func (c *Controller) memberLeadsLocked(nick string) (overall, lead5h, lead7d float64, has5h, has7d bool) {
+	if c.store == nil {
+		return 0, 0, 0, false, false
+	}
+	idx := c.indexOf(nick)
+	if idx < 0 {
+		return 0, 0, 0, false, false
+	}
+	snap := c.store.Get(c.backendAt(idx).QuotaKey())
+	now := c.now()
+
+	computeLead := func(util *float64, reset *time.Time, windowLen time.Duration) (float64, bool) {
+		if util == nil || reset == nil || !reset.After(now) {
+			return 0, false
+		}
+		elapsed := 1.0 - float64(reset.Sub(now))/float64(windowLen)
+		if elapsed < 0 {
+			elapsed = 0
+		} else if elapsed > 1 {
+			elapsed = 1
+		}
+		return *util - elapsed, true
+	}
+
+	lead5h, has5h = computeLead(snap.Unified5hUtilization, snap.Unified5hReset, window5h)
+	lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, window7d)
+
+	switch {
+	case has5h && has7d:
+		if lead5h >= lead7d {
+			overall = lead5h
+		} else {
+			overall = lead7d
+		}
+	case has5h:
+		overall = lead5h
+	case has7d:
+		overall = lead7d
+	}
+	return overall, lead5h, lead7d, has5h, has7d
+}
+
+// balanceSwitchLocked returns the index of the member to switch to when
+// the active member's overall lead exceeds the best candidate's lead by
+// at least balanceGap and the dwell timer has elapsed since the last
+// switch. Returns (0, false) when no switch is warranted. Caller holds
+// c.mu.
+func (c *Controller) balanceSwitchLocked() (int, bool) {
+	if !c.lastBalanceSwitch.IsZero() && c.now().Sub(c.lastBalanceSwitch) < c.balanceDwell {
+		return 0, false
+	}
+	curOverall, _, _, _, _ := c.memberLeadsLocked(c.nicks[c.cur])
+
+	bestIdx := -1
+	bestLead := curOverall
+	for i, nick := range c.nicks {
+		if i == c.cur || c.isExhaustedLocked(nick) {
+			continue
+		}
+		candOverall, _, _, _, _ := c.memberLeadsLocked(nick)
+		if curOverall-candOverall >= c.balanceGap && candOverall < bestLead {
+			bestLead = candOverall
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 {
+		return 0, false
+	}
+	return bestIdx, true
 }
 
 // firstHealthyLocked finds the backend to fail over to. For a priority
