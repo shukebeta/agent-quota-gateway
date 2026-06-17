@@ -22,15 +22,20 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // EnvPrefix marks an environment variable as belonging to the pool
-// configuration namespace. Three shapes are recognised under it:
+// configuration namespace. Recognised shapes under it:
 //
 //	AQG_POOL_<POOL>_BASE_URL=<upstream>            // the pool's default upstream
 //	AQG_POOL_<POOL>_BACKEND_<NICK>=<cred>[|<url>]  // one member of the pool
 //	AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>,...     // ordered preference (optional)
+//	AQG_POOL_<POOL>_BALANCE=lead                   // opt-in balanced routing (optional)
+//	AQG_POOL_<POOL>_BALANCE_GAP=<fraction>         // min lead gap to trigger a switch
+//	AQG_POOL_<POOL>_BALANCE_DWELL=<duration>       // min time between balance switches
 //
 // <POOL> and <NICK> are normalized (see normalizeName): lowercased, with
 // underscores folded to hyphens, so AQG_POOL_Z_AI_BACKEND_KEY_A is
@@ -40,19 +45,35 @@ import (
 // listed members in order (highest first) for the auto controller's
 // initial pick and failover target; when absent, the pool keeps the
 // default random-start, round-robin behaviour. It carries no credential.
+// PRIORITY and BALANCE are mutually exclusive — declaring both on the
+// same pool is a startup error.
 const EnvPrefix = "AQG_POOL_"
 
-// baseURLSuffix, backendInfix, and prioritySuffix are the structural
-// markers inside an EnvPrefix key. backendInfix is checked first so a
-// member declaration always wins over the suffix shapes.
+// baseURLSuffix, backendInfix, prioritySuffix, and the balance suffixes
+// are the structural markers inside an EnvPrefix key. backendInfix is
+// checked first so a member declaration always wins over the suffix shapes.
 const (
-	baseURLSuffix  = "_BASE_URL"
-	backendInfix   = "_BACKEND_"
-	prioritySuffix = "_PRIORITY"
+	baseURLSuffix      = "_BASE_URL"
+	backendInfix       = "_BACKEND_"
+	prioritySuffix     = "_PRIORITY"
+	balanceSuffix      = "_BALANCE"
+	balanceGapSuffix   = "_BALANCE_GAP"
+	balanceDwellSuffix = "_BALANCE_DWELL"
 )
 
 // priorityListSep separates nicks in an AQG_POOL_<POOL>_PRIORITY value.
 const priorityListSep = ","
+
+// defaultBalanceGap is the minimum lead difference (active minus candidate)
+// that triggers a balance switch when AQG_POOL_<POOL>_BALANCE_GAP is absent.
+// 0.15 means the active member must be consuming quota at least 15% faster
+// than the candidate (relative to elapsed window fraction) before switching.
+const defaultBalanceGap = 0.15
+
+// defaultBalanceDwell is the minimum time between balance switches when
+// AQG_POOL_<POOL>_BALANCE_DWELL is absent. 5 minutes bounds switches to
+// at most 12 per hour per pool, limiting prompt-cache disruption.
+const defaultBalanceDwell = 5 * time.Minute
 
 // credURLSep splits a member's value into its credential and an optional
 // per-member base-URL override: <credential>|<url>. A credential that
@@ -98,6 +119,19 @@ type pool struct {
 	// a subset of nicks. nil when the pool declared no AQG_POOL_<POOL>_PRIORITY
 	// — that pool keeps the default random-start, round-robin behaviour.
 	priority []string
+
+	// balance is the routing mode when the pool opted into balanced routing
+	// via AQG_POOL_<POOL>_BALANCE. Currently only "lead" is supported; ""
+	// means balanced mode is off. Mutually exclusive with priority.
+	balance string
+	// balanceGap is the minimum lead difference (active minus candidate)
+	// that triggers a balance switch. Set to defaultBalanceGap when
+	// AQG_POOL_<POOL>_BALANCE_GAP is absent.
+	balanceGap float64
+	// balanceDwell is the minimum time between balance switches for this
+	// pool. Set to defaultBalanceDwell when AQG_POOL_<POOL>_BALANCE_DWELL
+	// is absent.
+	balanceDwell time.Duration
 }
 
 // Load builds a Registry from AQG_POOL_* environment variables, using
@@ -130,6 +164,12 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 	poolURLOrigin := make(map[string]string)
 	poolPriority := make(map[string][]string) // pool -> declared preference order
 	poolPriorityOrigin := make(map[string]string)
+	poolBalance := make(map[string]string)        // pool -> "lead"
+	poolBalanceOrigin := make(map[string]string)   // pool -> env key, for errors
+	poolBalanceGap := make(map[string]float64)     // pool -> gap fraction
+	poolBalanceGapOrigin := make(map[string]string)
+	poolBalanceDwell := make(map[string]time.Duration) // pool -> dwell duration
+	poolBalanceDwellOrigin := make(map[string]string)
 	var members []rawMember
 	originKey := make(map[string]string) // pool/nick -> env var that produced it
 
@@ -207,7 +247,61 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			continue
 		}
 
-		return nil, fmt.Errorf("backend: %s is not a recognised %s<POOL>%s, %s<POOL>%s<NICK>, or %s<POOL>%s declaration", key, EnvPrefix, baseURLSuffix, EnvPrefix, backendInfix, EnvPrefix, prioritySuffix)
+		// _BALANCE_GAP and _BALANCE_DWELL must be checked before _BALANCE
+		// because _BALANCE would otherwise match any key ending in _BALANCE
+		// (it does not — CutSuffix requires an exact suffix — but the
+		// ordering makes the intent clear).
+		if poolPart, ok := strings.CutSuffix(rest, balanceGapSuffix); ok {
+			poolName := normalizeName(poolPart)
+			if poolName == "" {
+				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
+			}
+			if prev, dup := poolBalanceGapOrigin[poolName]; dup {
+				return nil, fmt.Errorf("backend: %s and %s both set the balance gap for pool %q", prev, key, poolName)
+			}
+			f, err := strconv.ParseFloat(val, 64)
+			if err != nil || f <= 0 {
+				return nil, fmt.Errorf("backend: %s must be a positive fraction (e.g. 0.15)", key)
+			}
+			poolBalanceGapOrigin[poolName] = key
+			poolBalanceGap[poolName] = f
+			continue
+		}
+
+		if poolPart, ok := strings.CutSuffix(rest, balanceDwellSuffix); ok {
+			poolName := normalizeName(poolPart)
+			if poolName == "" {
+				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
+			}
+			if prev, dup := poolBalanceDwellOrigin[poolName]; dup {
+				return nil, fmt.Errorf("backend: %s and %s both set the balance dwell for pool %q", prev, key, poolName)
+			}
+			d, err := time.ParseDuration(val)
+			if err != nil || d <= 0 {
+				return nil, fmt.Errorf("backend: %s must be a positive duration (e.g. 5m)", key)
+			}
+			poolBalanceDwellOrigin[poolName] = key
+			poolBalanceDwell[poolName] = d
+			continue
+		}
+
+		if poolPart, ok := strings.CutSuffix(rest, balanceSuffix); ok {
+			poolName := normalizeName(poolPart)
+			if poolName == "" {
+				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
+			}
+			if val != "lead" {
+				return nil, fmt.Errorf("backend: %s: unsupported balance mode %q; only \"lead\" is supported", key, val)
+			}
+			if prev, dup := poolBalanceOrigin[poolName]; dup {
+				return nil, fmt.Errorf("backend: %s and %s both set the balance mode for pool %q", prev, key, poolName)
+			}
+			poolBalanceOrigin[poolName] = key
+			poolBalance[poolName] = val
+			continue
+		}
+
+		return nil, fmt.Errorf("backend: %s is not a recognised AQG_POOL_ key (expected suffixes: _BASE_URL, _BACKEND_<NICK>, _PRIORITY, _BALANCE, _BALANCE_GAP, _BALANCE_DWELL)", key)
 	}
 
 	if len(members) == 0 {
@@ -262,6 +356,43 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			}
 		}
 		p.priority = order
+	}
+
+	// BALANCE_GAP and BALANCE_DWELL without BALANCE are configuration errors
+	// (most likely a misspelling of the pool name or a leftover setting).
+	for poolName, origin := range poolBalanceGapOrigin {
+		if _, ok := poolBalance[poolName]; !ok {
+			return nil, fmt.Errorf("backend: %s sets a balance gap for pool %q but %s%s%s is not set",
+				origin, poolName, EnvPrefix, strings.ToUpper(poolName), balanceSuffix)
+		}
+	}
+	for poolName, origin := range poolBalanceDwellOrigin {
+		if _, ok := poolBalance[poolName]; !ok {
+			return nil, fmt.Errorf("backend: %s sets a balance dwell for pool %q but %s%s%s is not set",
+				origin, poolName, EnvPrefix, strings.ToUpper(poolName), balanceSuffix)
+		}
+	}
+
+	for poolName, mode := range poolBalance {
+		p, ok := pools[poolName]
+		if !ok {
+			return nil, fmt.Errorf("backend: %s sets balance mode for pool %q, which has no backends", poolBalanceOrigin[poolName], poolName)
+		}
+		if len(p.priority) > 0 {
+			return nil, fmt.Errorf("backend: pool %q declares both %s and %s; balanced mode and priority routing are mutually exclusive",
+				poolName, poolBalanceOrigin[poolName], poolPriorityOrigin[poolName])
+		}
+		p.balance = mode
+		if gap, ok := poolBalanceGap[poolName]; ok {
+			p.balanceGap = gap
+		} else {
+			p.balanceGap = defaultBalanceGap
+		}
+		if dwell, ok := poolBalanceDwell[poolName]; ok {
+			p.balanceDwell = dwell
+		} else {
+			p.balanceDwell = defaultBalanceDwell
+		}
 	}
 
 	for _, p := range pools {
@@ -371,6 +502,28 @@ func (r *Registry) PoolPriority(poolName string) []string {
 	out := make([]string, len(p.priority))
 	copy(out, p.priority)
 	return out
+}
+
+// PoolBalanceGap returns the minimum lead difference the pool requires
+// before switching the active member in balanced mode. Returns 0 when the
+// pool is not in balanced mode or is unknown — the auto controller treats 0
+// as "balance mode off".
+func (r *Registry) PoolBalanceGap(poolName string) float64 {
+	p, ok := r.pools[normalizeName(poolName)]
+	if !ok || p.balance == "" {
+		return 0
+	}
+	return p.balanceGap
+}
+
+// PoolBalanceDwell returns the minimum time between balance switches for
+// the pool. Returns 0 when the pool is not in balanced mode or is unknown.
+func (r *Registry) PoolBalanceDwell(poolName string) time.Duration {
+	p, ok := r.pools[normalizeName(poolName)]
+	if !ok || p.balance == "" {
+		return 0
+	}
+	return p.balanceDwell
 }
 
 // ResolveIn returns the backend named by nick within poolName. ok is

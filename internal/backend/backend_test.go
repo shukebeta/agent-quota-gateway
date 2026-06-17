@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 )
 
 const testDefaultBaseURL = "https://api.anthropic.com"
@@ -278,6 +279,112 @@ func TestLoadFrom_priorityRejectsBadInput(t *testing.T) {
 			"AQG_POOL_CHN_PRIORITY=zai",
 			"AQG_POOL_chn_PRIORITY=zai",
 			"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+		},
+	}
+	for name, env := range cases {
+		if _, err := loadFrom(env, testDefaultBaseURL); err == nil {
+			t.Errorf("%s: expected error, got nil", name)
+		}
+	}
+}
+
+func TestLoadFrom_balanceParsed(t *testing.T) {
+	reg, err := loadFrom([]string{
+		"AQG_POOL_SUB_BALANCE=lead",
+		"AQG_POOL_SUB_BACKEND_A=cred-a",
+		"AQG_POOL_SUB_BACKEND_B=cred-b",
+	}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom: %v", err)
+	}
+	if got := reg.PoolBalanceGap("sub"); got != defaultBalanceGap {
+		t.Errorf("PoolBalanceGap(sub) = %v, want default %v", got, defaultBalanceGap)
+	}
+	if got := reg.PoolBalanceDwell("sub"); got != defaultBalanceDwell {
+		t.Errorf("PoolBalanceDwell(sub) = %v, want default %v", got, defaultBalanceDwell)
+	}
+}
+
+func TestLoadFrom_balanceWithCustomTuning(t *testing.T) {
+	reg, err := loadFrom([]string{
+		"AQG_POOL_SUB_BALANCE=lead",
+		"AQG_POOL_SUB_BALANCE_GAP=0.20",
+		"AQG_POOL_SUB_BALANCE_DWELL=10m",
+		"AQG_POOL_SUB_BACKEND_A=cred-a",
+		"AQG_POOL_SUB_BACKEND_B=cred-b",
+	}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom: %v", err)
+	}
+	if got := reg.PoolBalanceGap("sub"); got != 0.20 {
+		t.Errorf("PoolBalanceGap(sub) = %v, want 0.20", got)
+	}
+	if got := reg.PoolBalanceDwell("sub"); got != 10*time.Minute {
+		t.Errorf("PoolBalanceDwell(sub) = %v, want 10m", got)
+	}
+}
+
+func TestLoadFrom_balanceAbsentReturnsZero(t *testing.T) {
+	reg, err := loadFrom([]string{"AQG_POOL_AUTO_BACKEND_A=cred-a"}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom: %v", err)
+	}
+	if got := reg.PoolBalanceGap("auto"); got != 0 {
+		t.Errorf("PoolBalanceGap(non-balance pool) = %v, want 0", got)
+	}
+	if got := reg.PoolBalanceDwell("auto"); got != 0 {
+		t.Errorf("PoolBalanceDwell(non-balance pool) = %v, want 0", got)
+	}
+}
+
+func TestLoadFrom_balanceRejectsBadInput(t *testing.T) {
+	cases := map[string][]string{
+		"unsupported mode": {
+			"AQG_POOL_SUB_BALANCE=round-robin",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
+		"conflict with priority": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_SUB_PRIORITY=a",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+			"AQG_POOL_SUB_BACKEND_B=cred-b",
+		},
+		"balance for pool with no backends": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_OTHER_BACKEND_A=cred-a",
+		},
+		"gap without balance": {
+			"AQG_POOL_SUB_BALANCE_GAP=0.15",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
+		"dwell without balance": {
+			"AQG_POOL_SUB_BALANCE_DWELL=5m",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
+		"invalid gap (zero)": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_SUB_BALANCE_GAP=0",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
+		"invalid gap (non-numeric)": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_SUB_BALANCE_GAP=high",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
+		"invalid dwell (zero)": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_SUB_BALANCE_DWELL=0s",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
+		"invalid dwell (non-duration)": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_SUB_BALANCE_DWELL=fast",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
+		"duplicate balance var": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_sub_BALANCE=lead",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
 		},
 	}
 	for name, env := range cases {

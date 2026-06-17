@@ -195,13 +195,77 @@ is immediately rate-limited again is not switched to repeatedly — reactive
 `429` failover keeps precedence. Pools **without** a `PRIORITY` declaration
 never preempt, so their prompt cache is never interrupted.
 
+### Balanced routing within a pool
+
+By default the gateway is intentionally sticky: it rides one member until
+that member returns `429` or its quota store reports a fully consumed window.
+This maximises prompt-cache locality. The downside is that a pool of
+*interchangeable* subscription accounts can repeatedly over-drain one member
+across rolling 5-hour windows, burning its 7-day allowance much faster than
+the others.
+
+**Lead-based balanced routing** is an opt-in per-pool mode that adds a
+proactive switch when the active member's quota consumption is materially
+*ahead of schedule* relative to a healthier alternative. The metric is:
+
+```
+elapsed_fraction = 1 − (time_until_reset / window_length)   # clamped to [0, 1]
+lead = utilization − elapsed_fraction
+```
+
+A positive lead means the member is consuming faster than time is passing.
+The gateway computes `max(lead_5h, lead_7d)` over any windows whose
+utilization and reset are known, and switches when the active member's lead
+exceeds the best non-exhausted candidate's lead by at least the configured
+gap. A dwell timer prevents churn immediately after a switch.
+
+Enable it with `AQG_POOL_<POOL>_BALANCE=lead`:
+
+```
+# A pool of interchangeable subscription accounts, balanced by lead.
+AQG_POOL_SUB_BACKEND_A=sk-ant-...
+AQG_POOL_SUB_BACKEND_B=sk-ant-...
+AQG_POOL_SUB_BACKEND_C=sk-ant-...
+AQG_POOL_SUB_BALANCE=lead
+
+# Optional tuning (shown with their defaults):
+# AQG_POOL_SUB_BALANCE_GAP=0.15    # switch when active lead − best lead ≥ 0.15
+# AQG_POOL_SUB_BALANCE_DWELL=5m    # minimum time between switches
+```
+
+**How it interacts with the default sticky design:**
+
+- Between switches the pool is fully sticky: cache locality is preserved.
+- The switch fires on the request path (no background goroutine); the gap
+  and dwell keep it rare.
+- The lead check never synthesises probes — it reads only snapshots learned
+  from real traffic or the existing poller.
+- Exhausted members (live-429 parked or store-exhausted) are never chosen
+  as the balance target.
+- When no snapshot data is available for a member its lead is treated as 0
+  (neutral); the pool stays sticky until real traffic trains the store.
+
+**Cache-locality tradeoff:** a balance switch breaks prompt-cache continuity
+for the in-flight session, just like any other mid-session switch. Unlike a
+`429` switch (which is forced), a balance switch is *elective* — the session
+cache is sacrificed to avoid a worse outcome (7-day window tragedy). The gap
+(default 0.15) and dwell (default 5m) tune how eagerly the gateway makes
+that trade.
+
+**Mutual exclusion with `PRIORITY`:** a pool cannot declare both
+`BALANCE=lead` and `PRIORITY` — the two modes have conflicting goals.
+Declaring both is a startup error.
+
 ## Environment variables
 
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `AQG_POOL_<POOL>_BACKEND_<NICK>` | _(at least one required)_ | A pool member's credential, optionally `=<cred>\|<base-url>` to override the pool default upstream for that member. `<POOL>` and `<NICK>` are normalized (`AQG_POOL_Z_AI_BACKEND_KEY_A` → pool `z-ai`, member `key-a`). |
 | `AQG_POOL_<POOL>_BASE_URL` | `ANTHROPIC_BASE_URL` | The pool's default upstream; scheme and host are required. Omit it for pools that hit `api.anthropic.com`. |
-| `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest priority first (e.g. `zai,m3`). When set, the pool starts on and fails over toward the highest-priority healthy member instead of random/round-robin. Unlisted members rank last (sorted). Carries no credential. See [Priority within a pool](#priority-within-a-pool). |
+| `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest priority first (e.g. `zai,m3`). When set, the pool starts on and fails over toward the highest-priority healthy member instead of random/round-robin. Unlisted members rank last (sorted). Carries no credential. See [Priority within a pool](#priority-within-a-pool). Mutually exclusive with `BALANCE`. |
+| `AQG_POOL_<POOL>_BALANCE` | _(optional)_ | Set to `lead` to enable lead-based balanced routing. The gateway switches the active member when its lead (utilization minus elapsed window fraction) exceeds the best candidate's lead by at least `BALANCE_GAP`, subject to `BALANCE_DWELL`. Mutually exclusive with `PRIORITY`. See [Balanced routing within a pool](#balanced-routing-within-a-pool). |
+| `AQG_POOL_<POOL>_BALANCE_GAP` | `0.15` | Minimum lead difference that triggers a balance switch. Only valid when `BALANCE=lead` is set. |
+| `AQG_POOL_<POOL>_BALANCE_DWELL` | `5m` | Minimum time between balance switches. Accepts Go duration strings (e.g. `5m`, `2m30s`). Only valid when `BALANCE=lead` is set. |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
@@ -213,7 +277,9 @@ Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
 `AQG_POOL_*` shape, two keys colliding on the same pool/member, a
 `PRIORITY` that is empty, repeats a nick, names a nick that is not a member
-of the pool, or targets a pool with no members, both `LISTEN_ADDR` and
+of the pool, or targets a pool with no members, a `BALANCE` value other than
+`lead`, `BALANCE_GAP` or `BALANCE_DWELL` set without `BALANCE`, `BALANCE`
+and `PRIORITY` both declared on the same pool, both `LISTEN_ADDR` and
 `SHARED_LISTEN_ADDR` set at once, or a `SHARED_LISTEN_ADDR` outside the
 Tailscale ranges. A `|` in a credential is rejected because the tail must
 parse as a URL — tokens do not contain `|`.
