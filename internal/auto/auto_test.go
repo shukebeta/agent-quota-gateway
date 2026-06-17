@@ -71,14 +71,16 @@ func testRegistry(t *testing.T, nicks ...string) *backend.Registry {
 	return reg
 }
 
-// resp429 builds an upstream 429 response for backend b, carrying a
-// unified-reset header resetIn from the clock's current time (resetIn <= 0
-// omits the header).
+// resp429 builds an upstream genuine-quota 429 response for backend b.
+// It carries unified-status "rejected", a 5h utilization of 1.0 (at cap),
+// and — when resetIn > 0 — a unified-reset header. The utilization header
+// is what marks this as a genuine exhaustion 429 under the classifier.
 func resp429(b backend.Backend, clock *fixedClock, resetIn time.Duration) *http.Response {
 	ctx := backend.WithBackend(context.Background(), b)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
 	h := http.Header{}
 	h.Set("anthropic-ratelimit-unified-status", "rejected")
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "1.0")
 	if resetIn > 0 {
 		h.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(clock.now().Add(resetIn).Unix(), 10))
 	}
@@ -87,6 +89,24 @@ func resp429(b backend.Backend, clock *fixedClock, resetIn time.Duration) *http.
 		Header:     h,
 		Request:    req,
 		Body:       io.NopCloser(strings.NewReader("upstream 429 body")),
+	}
+}
+
+// resp429Policy builds a policy/punishment 429 response for backend b.
+// It carries no utilization headers, so the classifier treats it as a
+// policy 429 (no park, no failover).
+func resp429Policy(b backend.Backend) *http.Response {
+	ctx := backend.WithBackend(context.Background(), b)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	body := `{"type":"error","error":{"type":"rate_limit_error","message":"You are using an unsupported third-party client."}}`
+	return &http.Response{
+		StatusCode:    http.StatusTooManyRequests,
+		Header:        h,
+		Request:       req,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
 	}
 }
 
@@ -128,7 +148,6 @@ func TestModifyResponse_429RewritesTo503AndAdvances(t *testing.T) {
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c")
 
 	resp := resp429(c.resolve(t, "a"), clock, time.Hour)
-	resp.Header.Set("anthropic-ratelimit-unified-5h-utilization", "1.0")
 
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
@@ -263,19 +282,64 @@ func TestResolveAuto_reEligibleAfterReset(t *testing.T) {
 	}
 }
 
-// TestModifyResponse_missingResetHeaderParks proves a 429 with no usable
-// reset still parks the backend (failover proceeds) rather than looping
-// back onto the dead backend.
-func TestModifyResponse_missingResetHeaderParks(t *testing.T) {
+// TestModifyResponse_policy429NotParked proves a 429 with no utilization
+// headers (a policy/punishment 429) does not park the backend and does not
+// trigger failover. The backend stays in rotation; the client receives a 503
+// carrying the real upstream error body.
+func TestModifyResponse_policy429NotParked(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+
+	resp := resp429Policy(c.resolve(t, "a"))
+	origBody, _ := io.ReadAll(resp.Body)
+	resp.Body = io.NopCloser(bytes.NewReader(origBody)) // reset for ModifyResponse
+
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	// Status must be 503 (not 429, not left as 429).
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503", resp.StatusCode)
+	}
+	// Body must be the upstream error text verbatim.
+	gotBody, _ := io.ReadAll(resp.Body)
+	if string(gotBody) != string(origBody) {
+		t.Errorf("body=%q, want upstream body %q", gotBody, origBody)
+	}
+	// Backend must NOT be parked — still at "a".
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current()=%q, want a (no failover on policy 429)", got)
+	}
+	// No exhaustion mark.
+	if _, _, exhausted := c.ResolveAuto(); exhausted {
+		t.Errorf("ResolveAuto exhausted=true after policy 429, want false")
+	}
+	// Logged correctly.
+	if log := logBuf.String(); !strings.Contains(log, "policy 429") {
+		t.Errorf("policy 429 not logged; got %q", log)
+	}
+	// anthropic-ratelimit-* headers stripped.
+	if got := resp.Header.Get("anthropic-ratelimit-unified-status"); got != "" {
+		t.Errorf("anthropic-ratelimit header not stripped: %q", got)
+	}
+}
+
+// TestModifyResponse_genuine429NoResetHeaderParks proves that a genuine
+// quota 429 (utilization=1.0) with no reset header still parks the backend
+// for the conservative window — the utilization signal, not the reset, is
+// what triggers parking.
+func TestModifyResponse_genuine429NoResetHeaderParks(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "solo")
 
-	resp := resp429(c.resolve(t, "solo"), clock, 0) // no reset header
+	resp := resp429(c.resolve(t, "solo"), clock, 0) // utilization=1.0, no reset header
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
 	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d, want 429", resp.StatusCode)
+		t.Fatalf("status=%d, want 429 (single-backend pool dry)", resp.StatusCode)
 	}
 	// Still parked just shy of the conservative window.
 	clock.advance(defaultExhaustionWindow - time.Minute)
