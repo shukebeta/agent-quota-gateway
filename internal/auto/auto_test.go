@@ -519,6 +519,38 @@ func TestController_loadState(t *testing.T) {
 	}
 }
 
+// TestController_ClearExhausted verifies that ClearExhausted drops live-429
+// parks, returns the cleared nicks sorted, and makes the members selectable
+// again before their reset would have elapsed.
+func TestController_ClearExhausted(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+
+	// Park b and c an hour out via the reactive 429 path; a stays healthy.
+	reset := clock.now().Add(time.Hour)
+	c.record429("b", reset)
+	c.record429("c", reset)
+
+	cleared := c.ClearExhausted()
+	if want := []string{"b", "c"}; len(cleared) != 2 || cleared[0] != want[0] || cleared[1] != want[1] {
+		t.Fatalf("ClearExhausted returned %v, want %v", cleared, want)
+	}
+
+	// Both should now read healthy even though the reset is still an hour out.
+	c.mu.Lock()
+	bExhausted := c.isExhaustedLocked("b")
+	cExhausted := c.isExhaustedLocked("c")
+	c.mu.Unlock()
+	if bExhausted || cExhausted {
+		t.Fatalf("after ClearExhausted, b exhausted=%v c exhausted=%v, want both healthy", bExhausted, cExhausted)
+	}
+
+	// A second clear with nothing parked returns nil.
+	if again := c.ClearExhausted(); again != nil {
+		t.Fatalf("second ClearExhausted returned %v, want nil", again)
+	}
+}
+
 // TestController_loadState_expiredExhaustedDropped verifies that an exhausted
 // entry whose reset is already in the past is dropped on load.
 func TestController_loadState_expiredExhaustedDropped(t *testing.T) {

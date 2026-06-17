@@ -120,6 +120,29 @@ func (p *Pools) Current(poolName string) (backend.Backend, bool) {
 	return c.CurrentBackend(), true
 }
 
+// ClearExhausted drops the named pool's live-429 parks (see
+// Controller.ClearExhausted). ok is false for an unknown pool.
+func (p *Pools) ClearExhausted(poolName string) (cleared []string, ok bool) {
+	c, ok := p.byPool[poolName]
+	if !ok {
+		return nil, false
+	}
+	return c.ClearExhausted(), true
+}
+
+// ClearAllExhausted drops live-429 parks across every pool, returning a
+// map of pool name to the nicks cleared (pools with nothing parked are
+// omitted).
+func (p *Pools) ClearAllExhausted() map[string][]string {
+	out := make(map[string][]string)
+	for name, c := range p.byPool {
+		if cleared := c.ClearExhausted(); len(cleared) > 0 {
+			out[name] = cleared
+		}
+	}
+	return out
+}
+
 // MemberStatus describes one pool member's current state for /_gateway/pool.
 type MemberStatus struct {
 	Nick           string          `json:"nick"`
@@ -337,6 +360,29 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	c.cur = idx
 	c.notifyMutate()
 	return c.backendAt(idx), c.waitUntil(reset), true
+}
+
+// ClearExhausted drops every live-429 park for this pool, making each
+// member immediately selectable again (still subject to the quota store's
+// own fully-consumed window check). It exists to undo parks written by a
+// transient or erroneous upstream 429 — e.g. an account that got 429'd by
+// a misconfigured request but in fact still has quota. It does NOT touch
+// store-sourced exhaustion, which reflects polled reality and clears on its
+// own reset. Returns the nicks whose park was cleared, sorted.
+func (c *Controller) ClearExhausted() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.exhausted) == 0 {
+		return nil
+	}
+	cleared := make([]string, 0, len(c.exhausted))
+	for nick := range c.exhausted {
+		cleared = append(cleared, nick)
+	}
+	sort.Strings(cleared)
+	c.exhausted = make(map[string]time.Time)
+	c.notifyMutate()
+	return cleared
 }
 
 // Current returns the nick of the active sticky backend.

@@ -141,6 +141,7 @@ func run() error {
 	mux.HandleFunc("/_gateway/health", healthHandler())
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
+	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
 	handler := reqlog.Middleware(logging.Middleware(mux))
@@ -279,6 +280,36 @@ func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(store.Get(key))
+	}
+}
+
+// clearHandler serves POST /_gateway/clear — drops live-429 parks so a
+// member wrongly marked exhausted (e.g. a transient/misconfigured 429 on an
+// account that still has quota) becomes selectable again without waiting out
+// the park or restarting the gateway. With ?pool=<name> it clears one pool;
+// without the param it clears every pool. Only the reactive 429 parks are
+// cleared — store-sourced exhaustion reflects polled reality and is left
+// alone. Non-POST returns 405.
+func clearHandler(pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		poolName := backend.NormalizeName(r.URL.Query().Get("pool"))
+		if poolName == "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"cleared": pools.ClearAllExhausted()})
+			return
+		}
+		cleared, ok := pools.ClearExhausted(poolName)
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool not found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"pool": poolName, "cleared": cleared})
 	}
 }
 
