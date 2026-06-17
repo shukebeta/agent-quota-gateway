@@ -484,10 +484,11 @@ func (c *Controller) persistState() PoolPersistState {
 
 // ModifyResponse is the per-pool failover hook. It acts on a request that
 // drew an upstream 429; everything else passes through untouched. On such
-// a 429 it records the backend's reset window, advances the sticky
-// pointer, and either rewrites the response to a 503 (a healthy member
-// remains — the client retry will succeed there) or forwards an honest
-// 429 with a precise Retry-After (the pool is dry).
+// a 429 it first classifies whether the 429 signals genuine quota exhaustion
+// (utilization at cap) or is a policy/punishment 429 (no utilization signal).
+// Policy 429s are not parked — the backend stays in rotation and the client
+// receives a 503 carrying the upstream error body. Only genuine exhaustion
+// 429s park the backend and advance the sticky pointer.
 func (c *Controller) ModifyResponse(resp *http.Response) error {
 	if resp == nil || resp.Request == nil {
 		return nil
@@ -497,6 +498,13 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	}
 	b, ok := backend.FromContext(resp.Request.Context())
 	if !ok {
+		return nil
+	}
+
+	respSnap := quota.Extract(resp)
+	if !c.isGenuineExhaustionSignal(b.Nick, respSnap) {
+		fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.pool, b.Nick)
+		rewriteTo503WithBody(resp)
 		return nil
 	}
 
@@ -515,6 +523,30 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	}
 	rewriteTo503(resp)
 	return nil
+}
+
+// isGenuineExhaustionSignal reports whether a 429 response for nick represents
+// real quota exhaustion. It checks the 429 response headers first (a genuine
+// rate-limit 429 self-reports utilization at cap), then falls back to the most
+// recent store snapshot for that backend. Returns false — fail safe toward not
+// parking — when neither source carries any utilization data.
+func (c *Controller) isGenuineExhaustionSignal(nick string, respSnap quota.Snapshot) bool {
+	for _, u := range []*float64{respSnap.Unified5hUtilization, respSnap.Unified7dUtilization} {
+		if u != nil && *u >= exhaustionUtilizationThreshold {
+			return true
+		}
+	}
+	if c.store != nil {
+		if idx := c.indexOf(nick); idx >= 0 {
+			storeSnap := c.store.Get(c.backendAt(idx).QuotaKey())
+			for _, u := range []*float64{storeSnap.Unified5hUtilization, storeSnap.Unified7dUtilization} {
+				if u != nil && *u >= exhaustionUtilizationThreshold {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // record429Result reports the outcome of recording an upstream 429.
@@ -745,6 +777,25 @@ func rewriteTo503(resp *http.Response) {
 	}
 	h.Set("Content-Type", "application/json")
 	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Del("Content-Encoding")
+	h.Set("Retry-After", strconv.Itoa(switchRetryAfterSeconds))
+}
+
+// rewriteTo503WithBody turns an upstream policy/punishment 429 into a 503
+// while keeping the upstream body intact, so the client can read the actual
+// error message (e.g. a threatening client-identity warning from Anthropic).
+// The upstream rate-limit headers are stripped (they carry no useful quota
+// state for a policy 429), but Content-Type is preserved from the upstream.
+func rewriteTo503WithBody(resp *http.Response) {
+	resp.StatusCode = http.StatusServiceUnavailable
+	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
+
+	h := resp.Header
+	for k := range h {
+		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
+			h.Del(k)
+		}
+	}
 	h.Del("Content-Encoding")
 	h.Set("Retry-After", strconv.Itoa(switchRetryAfterSeconds))
 }

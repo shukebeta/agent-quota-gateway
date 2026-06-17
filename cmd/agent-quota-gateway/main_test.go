@@ -276,6 +276,7 @@ func TestIntegration_autoFailover(t *testing.T) {
 		mu.Unlock()
 		if is429 {
 			w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
+			w.Header().Set("anthropic-ratelimit-unified-5h-utilization", "1.0")
 			w.Header().Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()))
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error"}}`))
