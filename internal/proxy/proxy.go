@@ -160,10 +160,15 @@ func stampAuth(h http.Header, credential string) {
 	switch {
 	case isOAuthToken(cred):
 		// OAuth tokens authenticate over Bearer, not x-api-key, and
-		// require the beta opt-in.
+		// require both beta opt-ins. claudeCodeBeta gates the "extra usage"
+		// quota that Claude Code subscriptions carry — without it Anthropic
+		// treats the request as a non-Claude-Code call and denies extra usage
+		// even with a valid OAuth token. X-App: cli is the companion signal.
 		h.Del("x-api-key")
 		h.Set("Authorization", "Bearer "+cred)
+		h.Set("X-App", "cli")
 		ensureBeta(h, oauthBeta)
+		ensureBeta(h, claudeCodeBeta)
 	case isAPIKey(cred):
 		// Anthropic API keys use x-api-key; drop the inbound selector that
 		// arrived on Authorization so it never goes upstream.
@@ -208,6 +213,12 @@ func joinPath(basePath, requestPath string) string {
 // (Claude Code subscription) tokens. Without it, a Bearer-authenticated
 // request is rejected.
 const oauthBeta = "oauth-2025-04-20"
+
+// claudeCodeBeta gates the "extra usage" quota on Claude Code subscriptions.
+// Anthropic checks for this flag (and X-App: cli) to decide whether a request
+// qualifies for extra usage — omitting it causes a 400 "out of extra usage"
+// even when the OAuth token itself is valid.
+const claudeCodeBeta = "claude-code-20250219"
 
 // isOAuthToken reports whether key is a Claude Code OAuth token. OAuth
 // tokens use the stable sk-ant-oat prefix and must be sent as a Bearer

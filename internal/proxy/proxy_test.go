@@ -416,9 +416,12 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	}
 }
 
-// oauthBetaValue mirrors the proxy's internal oauthBeta constant; the
-// external test package can't reach the unexported one.
-const oauthBetaValue = "oauth-2025-04-20"
+// oauthBetaValue and claudeCodeBetaValue mirror the proxy's internal constants;
+// the external test package can't reach the unexported ones.
+const (
+	oauthBetaValue     = "oauth-2025-04-20"
+	claudeCodeBetaValue = "claude-code-20250219"
+)
 
 // newGatewayWithKey is like newGateway but lets the test choose the
 // backend credential so the three auth schemes can be exercised.
@@ -439,11 +442,12 @@ func newGatewayWithKey(t *testing.T, key string, handler http.HandlerFunc) *http
 
 func TestProxy_oauthTokenUsesBearer(t *testing.T) {
 	const token = "sk-ant-oat01-secret-token"
-	var gotAuth, gotKey, gotBeta string
+	var gotAuth, gotKey, gotBeta, gotApp string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotKey = r.Header.Get("x-api-key")
 		gotBeta = r.Header.Get("anthropic-beta")
+		gotApp = r.Header.Get("X-App")
 		w.WriteHeader(http.StatusOK)
 	})
 	gw := newGatewayWithKey(t, token, upstream)
@@ -467,8 +471,12 @@ func TestProxy_oauthTokenUsesBearer(t *testing.T) {
 	if gotKey != "" {
 		t.Errorf("x-api-key = %q, want empty (OAuth tokens must not be sent as x-api-key)", gotKey)
 	}
-	if gotBeta != oauthBetaValue {
-		t.Errorf("anthropic-beta = %q, want %q", gotBeta, oauthBetaValue)
+	wantBeta := oauthBetaValue + "," + claudeCodeBetaValue
+	if gotBeta != wantBeta {
+		t.Errorf("anthropic-beta = %q, want %q", gotBeta, wantBeta)
+	}
+	if gotApp != "cli" {
+		t.Errorf("X-App = %q, want %q", gotApp, "cli")
 	}
 }
 
@@ -526,7 +534,7 @@ func TestProxy_oauthTokenPreservesClientBeta(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	want := "prompt-caching-2024-07-31," + oauthBetaValue
+	want := "prompt-caching-2024-07-31," + oauthBetaValue + "," + claudeCodeBetaValue
 	if gotBeta != want {
 		t.Errorf("anthropic-beta = %q, want %q (client beta preserved, oauth flag appended once)", gotBeta, want)
 	}
@@ -554,7 +562,9 @@ func TestProxy_oauthTokenDoesNotDuplicateBeta(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	if gotBeta != oauthBetaValue {
-		t.Errorf("anthropic-beta = %q, want %q (no duplication)", gotBeta, oauthBetaValue)
+	// Client sent oauthBeta already; claudeCodeBeta still gets appended once.
+	want := oauthBetaValue + "," + claudeCodeBetaValue
+	if gotBeta != want {
+		t.Errorf("anthropic-beta = %q, want %q (no duplication of oauth flag, claude-code flag appended)", gotBeta, want)
 	}
 }
