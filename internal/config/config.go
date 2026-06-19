@@ -79,6 +79,25 @@ type Config struct {
 	StateFile string
 }
 
+// Inputs bundles all gateway configuration inputs for the Build function.
+// Empty strings mean "unset" (unless otherwise noted).
+type Inputs struct {
+	// AnthropicBaseURL is the upstream URL. Empty string uses DefaultBaseURL.
+	AnthropicBaseURL string
+
+	// ListenAddr is the loopback bind address. Empty string uses DefaultListenAddr.
+	ListenAddr string
+
+	// SharedListenAddr is the Tailscale bind address for shared mode.
+	// Empty string means shared mode is off.
+	SharedListenAddr string
+
+	// StateFile is the path for the persistent state file. Empty string
+	// means disabled; no $STATE_DIRECTORY consultation (that fallback
+	// is env-only).
+	StateFile string
+}
+
 // Load reads the gateway configuration from the process environment.
 //
 // Returns an error if any value is malformed so a misconfigured
@@ -95,15 +114,46 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("%s and %s are mutually exclusive: set exactly one (loopback by default, or a Tailscale address for shared mode)", EnvListenAddr, EnvSharedListenAddr)
 	}
 
+	inputs := Inputs{
+		AnthropicBaseURL:  getEnv(EnvAnthropicBaseURL, DefaultBaseURL),
+		ListenAddr:        getEnv(EnvListenAddr, DefaultListenAddr),
+		SharedListenAddr:  shared,
+		StateFile:         resolveStateFile(),
+	}
+	// Build's mutual-exclusion check uses non-emptiness, so we must
+	// pass empty for the unset listen knob to avoid a false positive.
+	if !listenSet {
+		inputs.ListenAddr = ""
+	}
+	return Build(inputs)
+}
+
+// Build constructs a Config from Inputs. It validates the inputs and
+// returns a Config or an error. The mutual-exclusion rule for listen
+// knobs is enforced here (both non-empty is an error).
+func Build(in Inputs) (Config, error) {
+	// Exactly one listen knob may be set.
+	listenSet := in.ListenAddr != ""
+	sharedSet := in.SharedListenAddr != ""
+	if listenSet && sharedSet {
+		return Config{}, fmt.Errorf("listen_addr and shared_listen_addr are mutually exclusive: set exactly one (loopback by default, or a Tailscale address for shared mode)")
+	}
+
 	cfg := Config{
-		AnthropicBaseURL: getEnv(EnvAnthropicBaseURL, DefaultBaseURL),
-		StateFile:        resolveStateFile(),
+		AnthropicBaseURL: in.AnthropicBaseURL,
+		StateFile:        in.StateFile,
+	}
+	if in.AnthropicBaseURL == "" {
+		cfg.AnthropicBaseURL = DefaultBaseURL
 	}
 	if sharedSet {
-		cfg.ListenAddr = shared
+		cfg.ListenAddr = in.SharedListenAddr
 		cfg.Shared = true
 	} else {
-		cfg.ListenAddr = getEnv(EnvListenAddr, DefaultListenAddr)
+		cfg.ListenAddr = in.ListenAddr
+		if cfg.ListenAddr == "" {
+			cfg.ListenAddr = DefaultListenAddr
+		}
 	}
 
 	if err := cfg.validate(); err != nil {
