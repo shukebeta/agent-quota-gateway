@@ -1,0 +1,51 @@
+{
+  "base_url": "https://api.anthropic.com",
+  "listen_addr": "127.0.0.1:8080",
+  "shared_listen_addr": "",
+  "state_file": "",
+  "pools": {
+    "auto": {
+      "base_url": "",
+      "members": {
+        "a": {
+          "credential": "sk-ant-oat-PLACEHOLDER-A"
+        },
+        "b": {
+          "credential": "sk-ant-oat-PLACEHOLDER-B"
+        }
+      },
+      "priority": ["a", "b"],
+      "balance": "",
+      "balance_gap": 0,
+      "balance_dwell": ""
+    },
+    "balanced": {
+      "base_url": "",
+      "members": {
+        "x": {
+          "credential": "sk-ant-oat-PLACEHOLDER-X"
+        },
+        "y": {
+          "credential": "sk-ant-oat-PLACEHOLDER-Y",
+          "base_url": "https://custom.example.com"
+        }
+      },
+      "priority": [],
+      "balance": "lead",
+      "balance_gap": 0.2,
+      "balance_dwell": "10m"
+    },
+    "api": {
+      "base_url": "https://api.anthropic.com",
+      "members": {
+        "k1": {
+          "credential": "sk-ant-api-PLACEHOLDER-K1"
+        }
+      },
+      "priority": [],
+      "balance": "",
+      "balance_gap": 0,
+      "balance_dwell": ""
+    }
+  }
+}

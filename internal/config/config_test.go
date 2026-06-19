@@ -194,3 +194,107 @@ func TestLoad_acceptsValidBaseURL(t *testing.T) {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
 }
+
+func TestBuild_defaults(t *testing.T) {
+	cfg, err := Build(Inputs{})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if cfg.AnthropicBaseURL != DefaultBaseURL {
+		t.Errorf("BaseURL = %q, want %q", cfg.AnthropicBaseURL, DefaultBaseURL)
+	}
+	if cfg.ListenAddr != DefaultListenAddr {
+		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, DefaultListenAddr)
+	}
+	if cfg.Shared {
+		t.Error("Shared = true, want false")
+	}
+}
+
+func TestBuild_overrides(t *testing.T) {
+	inputs := Inputs{
+		AnthropicBaseURL: "https://example.test",
+		ListenAddr:        "127.0.0.1:9000",
+		SharedListenAddr:  "",
+		StateFile:         "/tmp/state.json",
+	}
+	cfg, err := Build(inputs)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if cfg.AnthropicBaseURL != "https://example.test" {
+		t.Errorf("BaseURL = %q", cfg.AnthropicBaseURL)
+	}
+	if cfg.ListenAddr != "127.0.0.1:9000" {
+		t.Errorf("ListenAddr = %q", cfg.ListenAddr)
+	}
+	if cfg.StateFile != "/tmp/state.json" {
+		t.Errorf("StateFile = %q", cfg.StateFile)
+	}
+}
+
+func TestBuild_sharedMode(t *testing.T) {
+	inputs := Inputs{
+		AnthropicBaseURL: DefaultBaseURL,
+		SharedListenAddr: "100.101.102.103:8080",
+	}
+	cfg, err := Build(inputs)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if !cfg.Shared {
+		t.Error("Shared = false, want true")
+	}
+	if cfg.ListenAddr != "100.101.102.103:8080" {
+		t.Errorf("ListenAddr = %q", cfg.ListenAddr)
+	}
+}
+
+func TestBuild_rejectsBothListen(t *testing.T) {
+	inputs := Inputs{
+		ListenAddr:       "127.0.0.1:8080",
+		SharedListenAddr: "100.101.102.103:8080",
+	}
+	_, err := Build(inputs)
+	if err == nil {
+		t.Error("Build() expected error when both listen knobs are set")
+	}
+}
+
+func TestBuild_rejectsNonLoopback(t *testing.T) {
+	inputs := Inputs{
+		ListenAddr: "0.0.0.0:8080",
+	}
+	_, err := Build(inputs)
+	if err == nil {
+		t.Error("Build() expected error for non-loopback listen_addr")
+	}
+}
+
+func TestBuild_rejectsNonTailscaleShared(t *testing.T) {
+	inputs := Inputs{
+		SharedListenAddr: "192.168.1.1:8080",
+	}
+	_, err := Build(inputs)
+	if err == nil {
+		t.Error("Build() expected error for non-Tailscale shared_listen_addr")
+	}
+}
+
+func TestLoad_stillGreen(t *testing.T) {
+	// Verify Load() still works after the Build refactor.
+	t.Setenv(EnvAnthropicBaseURL, "")
+	t.Setenv(EnvListenAddr, "")
+	t.Setenv(EnvSharedListenAddr, "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AnthropicBaseURL != DefaultBaseURL {
+		t.Errorf("BaseURL = %q, want %q", cfg.AnthropicBaseURL, DefaultBaseURL)
+	}
+	if cfg.ListenAddr != DefaultListenAddr {
+		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, DefaultListenAddr)
+	}
+}
