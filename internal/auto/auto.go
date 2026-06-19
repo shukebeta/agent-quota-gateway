@@ -269,8 +269,8 @@ type PoolRuntimeConfig struct {
 
 // AddedMember is a runtime-added pool member with credential.
 type AddedMember struct {
-	Credential string // stored, never returned in config views
-	BaseURL    string // optional; pool default when empty
+	Credential string `json:"credential"`           // stored, never returned in config views
+	BaseURL    string `json:"base_url,omitempty"` // optional; pool default when empty
 }
 
 // LoadPersistState applies previously persisted routing state to each pool's
@@ -369,6 +369,11 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string) (int, erro
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Validate baseURL is provided when pool has no static members to fall back to.
+	if baseURL == "" && len(c.nicks) == 0 {
+		return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no static members")
+	}
 
 	// Check for duplicate: already exists as static or runtime-added.
 	if c.indexOf(normalized) >= 0 {
