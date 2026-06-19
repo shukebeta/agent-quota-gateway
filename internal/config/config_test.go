@@ -214,9 +214,9 @@ func TestBuild_defaults(t *testing.T) {
 func TestBuild_overrides(t *testing.T) {
 	inputs := Inputs{
 		AnthropicBaseURL: "https://example.test",
-		ListenAddr:        "127.0.0.1:9000",
-		SharedListenAddr:  "",
-		StateFile:         "/tmp/state.json",
+		ListenAddr:       "127.0.0.1:9000",
+		SharedListenAddr: "",
+		StateFile:        "/tmp/state.json",
 	}
 	cfg, err := Build(inputs)
 	if err != nil {

@@ -256,10 +256,10 @@ func TestAddRemoveEndpoints(t *testing.T) {
 	}
 
 	// Error cases.
-	addJSON(t, srv.URL+"/_gateway/pool/auto/member/a", `{"credential":"sk-ant-x"}`, http.StatusConflict) // duplicate nick
-	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{}`, http.StatusBadRequest)           // empty credential
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/a", `{"credential":"sk-ant-x"}`, http.StatusConflict)             // duplicate nick
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{}`, http.StatusBadRequest)                                // empty credential
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{"credential":"x","base_url":"!"}`, http.StatusBadRequest) // invalid URL
-	delete(t, srv.URL+"/_gateway/pool/ghost/member/a", http.StatusNotFound) // unknown pool
+	delete(t, srv.URL+"/_gateway/pool/ghost/member/a", http.StatusNotFound)                                          // unknown pool
 }
 
 func addJSON(t *testing.T, url, body string, wantStatus int) {
