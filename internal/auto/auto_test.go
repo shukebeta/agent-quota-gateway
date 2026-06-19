@@ -111,6 +111,23 @@ func resp429Policy(b backend.Backend) *http.Response {
 	}
 }
 
+// respAuth builds an upstream credential-rejection response (401/403) for
+// backend b — what a pulled/revoked account returns instead of a 429.
+func respAuth(b backend.Backend, code int) *http.Response {
+	ctx := backend.WithBackend(context.Background(), b)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	body := `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`
+	return &http.Response{
+		StatusCode:    code,
+		Header:        h,
+		Request:       req,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
 func newController(t *testing.T, start int, clock *fixedClock, logOut io.Writer, nicks ...string) *Controller {
 	t.Helper()
 	return NewController(testRegistry(t, nicks...), "auto", start, nil, clock.now, logOut)
@@ -324,6 +341,62 @@ func TestModifyResponse_policy429NotParked(t *testing.T) {
 	// anthropic-ratelimit-* headers stripped.
 	if got := resp.Header.Get("anthropic-ratelimit-unified-status"); got != "" {
 		t.Errorf("anthropic-ratelimit header not stripped: %q", got)
+	}
+}
+
+// TestModifyResponse_authRejectionParksAndAdvances proves that a 401/403 from
+// a pulled/revoked account parks the backend and fails the pool over to a
+// healthy member, rewriting the response to a switch 503 — the fix for a pool
+// sticking to a dead account that never emits a 429.
+func TestModifyResponse_authRejectionParksAndAdvances(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+			var logBuf bytes.Buffer
+			c := newController(t, 0, clock, &logBuf, "a", "b", "c")
+
+			resp := respAuth(c.resolve(t, "a"), code)
+			if err := c.ModifyResponse(resp); err != nil {
+				t.Fatalf("ModifyResponse: %v", err)
+			}
+
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("status=%d, want 503 (switch)", resp.StatusCode)
+			}
+			if got := c.Current(); got != "b" {
+				t.Errorf("Current()=%q, want b (advanced off the dead account)", got)
+			}
+			// The parked member stays unselectable for the conservative window.
+			if _, parked := c.exhausted["a"]; !parked {
+				t.Errorf("nick a not parked after %d", code)
+			}
+			if log := logBuf.String(); !strings.Contains(log, fmt.Sprintf("a -> b (a returned %d)", code)) {
+				t.Errorf("auth failover not logged as expected; got %q", log)
+			}
+		})
+	}
+}
+
+// TestModifyResponse_authRejectionAllDeadForwardsStatus proves that when every
+// member is dead, the last auth rejection is forwarded honestly (the original
+// status, not a synthetic 503) so the client sees the real failure.
+func TestModifyResponse_authRejectionAllDeadForwardsStatus(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+
+	if err := c.ModifyResponse(respAuth(c.resolve(t, "a"), http.StatusUnauthorized)); err != nil {
+		t.Fatalf("ModifyResponse a: %v", err)
+	}
+	resp := respAuth(c.resolve(t, "b"), http.StatusUnauthorized)
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse b: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status=%d, want 401 forwarded honestly when all dead", resp.StatusCode)
+	}
+	if !strings.Contains(logBuf.String(), "all backends exhausted") {
+		t.Errorf("all-dead not logged; got %q", logBuf.String())
 	}
 }
 

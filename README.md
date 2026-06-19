@@ -43,8 +43,10 @@ across vendors loses the prompt cache, and quota semantics differ).
 - Streaming (SSE) is forwarded without buffering — the first event
   reaches the client as soon as the upstream writes it.
 - Error responses from upstream propagate to the client with the original
-  status code (except a `429`, which auto-rotation handles — see
-  [Pools and selectors](#pools-and-selectors)).
+  status code, except those auto-rotation handles: a `429` (quota), and a
+  `401`/`403` (the backend's credential was rejected — revoked, expired, or
+  the account pulled), which fail the pool over to a healthy member rather
+  than stick to a dead account. See [Pools and selectors](#pools-and-selectors).
 - One log line per request (method, path, status, duration, request ID).
   Request bodies, response bodies, and credential headers are never
   logged.
@@ -335,6 +337,13 @@ zero-probe**, per pool:
   signals a spent window through its dashboard API, not a clean pre-stream
   `429` — without it such a member would never fail off. At `100%` the next
   request would `429` anyway, so failing off then costs no usable cache.
+- **Dead-credential switch.** A member that returns `401`/`403` (its
+  credential was revoked, expired, or the account pulled) is parked for the
+  conservative default window and the pool fails over — a dead account never
+  emits a `429`, so without this the pool would stick to it and return the
+  auth error to every client. The park is cleared by `POST /_gateway/clear`
+  once the account is restored, or retried automatically when the window
+  elapses.
 - **Zero probe.** The starting member is chosen at random on startup (or by
   declared priority — see below) and its quota fills in from the first real
   response. No member is ever contacted just to measure it. This is also why

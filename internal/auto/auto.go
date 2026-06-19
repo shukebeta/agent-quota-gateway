@@ -609,18 +609,24 @@ func (c *Controller) persistState() PoolPersistState {
 	return ps
 }
 
-// ModifyResponse is the per-pool failover hook. It acts on a request that
-// drew an upstream 429; everything else passes through untouched. On such
-// a 429 it first classifies whether the 429 signals genuine quota exhaustion
-// (utilization at cap) or is a policy/punishment 429 (no utilization signal).
-// Policy 429s are not parked — the backend stays in rotation and the client
-// receives a 503 carrying the upstream error body. Only genuine exhaustion
-// 429s park the backend and advance the sticky pointer.
+// ModifyResponse is the per-pool failover hook. It acts on two classes of
+// upstream response; everything else passes through untouched.
+//
+//   - 429 Too Many Requests: it first classifies whether the 429 signals
+//     genuine quota exhaustion (utilization at cap) or is a policy/punishment
+//     429 (no utilization signal). Policy 429s are not parked — the backend
+//     stays in rotation and the client receives a 503 carrying the upstream
+//     error body. Only genuine exhaustion 429s park the backend and advance
+//     the sticky pointer.
+//   - 401 Unauthorized / 403 Forbidden: the backend's own credential was
+//     rejected — revoked, expired, or the account pulled. The gateway stamps
+//     the credential itself (the client never supplies one), so the rejection
+//     is always about the backend. The member is parked and the pool fails
+//     over, rather than sticking to a dead account and returning the auth
+//     error to every client. A pulled account never emits a 429, so without
+//     this the pool would never migrate off it (the reported bug).
 func (c *Controller) ModifyResponse(resp *http.Response) error {
 	if resp == nil || resp.Request == nil {
-		return nil
-	}
-	if resp.StatusCode != http.StatusTooManyRequests {
 		return nil
 	}
 	b, ok := backend.FromContext(resp.Request.Context())
@@ -628,25 +634,50 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		return nil
 	}
 
-	respSnap := quota.Extract(resp)
-	if !c.isGenuineExhaustionSignal(b.Nick, respSnap) {
-		fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.pool, b.Nick)
-		rewriteTo503WithBody(resp)
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
+		respSnap := quota.Extract(resp)
+		if !c.isGenuineExhaustionSignal(b.Nick, respSnap) {
+			fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.pool, b.Nick)
+			rewriteTo503WithBody(resp)
+			return nil
+		}
+		// A genuine 429 carries a precise window reset; park until then.
+		return c.parkAndFailover(resp, b.Nick, c.resetFrom(resp), "hit 429")
+	case isCredentialRejected(resp.StatusCode):
+		// An auth rejection has no reset — the credential is simply dead — so
+		// park for the conservative default window: long enough to keep the
+		// pool off the dead account, short enough that a restored account is
+		// retried without an operator restart (or an immediate /_gateway/clear).
+		return c.parkAndFailover(resp, b.Nick, c.now().Add(defaultExhaustionWindow), fmt.Sprintf("returned %d", resp.StatusCode))
+	default:
 		return nil
 	}
+}
 
-	reset := c.resetFrom(resp)
-	res := c.record429(b.Nick, reset)
+// isCredentialRejected reports whether code means the backend's credential
+// was refused upstream (401/403) — a backend-fatal signal distinct from a
+// 429's recoverable quota exhaustion.
+func isCredentialRejected(code int) bool {
+	return code == http.StatusUnauthorized || code == http.StatusForbidden
+}
+
+// parkAndFailover parks nick until reset, advances the sticky pointer, and
+// rewrites resp: a 503 "backend switching" when a healthy member remains, or
+// the honest upstream status with a precise Retry-After when the pool is dry.
+// reason is the log phrase describing why the backend was parked.
+func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset time.Time, reason string) error {
+	res := c.record429(nick, reset)
 
 	if res.allExhausted {
 		secs := retryAfterSeconds(res.retryAfter)
 		setRetryAfter(resp.Header, secs)
-		fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; forwarding 429 (retry after %ds)\n", c.pool, secs)
+		fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; forwarding upstream %d (retry after %ds)\n", c.pool, resp.StatusCode, secs)
 		return nil
 	}
 
 	if res.switched {
-		fmt.Fprintf(c.logOut, "auto[%s]: %s -> %s (%s hit 429)\n", c.pool, b.Nick, res.to, b.Nick)
+		fmt.Fprintf(c.logOut, "auto[%s]: %s -> %s (%s %s)\n", c.pool, nick, res.to, nick, reason)
 	}
 	rewriteTo503(resp)
 	return nil
