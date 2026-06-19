@@ -15,16 +15,29 @@ import (
 
 // configMux builds a ServeMux with the runtime-config routes wired exactly as
 // run() wires them, so the path-pattern handlers can resolve r.PathValue.
+// The /_gateway/ui route is exercised by uiMux instead — that handler is
+// pools-free and does not belong in this mux.
 func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/ui", uiHandler())
 	mux.HandleFunc("/_gateway/config", configHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// uiMux builds a ServeMux that registers only /_gateway/ui. The UI handler
+// takes no *auto.Pools — it serves a static embedded asset — so the UI tests
+// do not need the full runtime-config mux or any AQG_POOL_* env setup.
+func uiMux(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_gateway/ui", uiHandler())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -286,7 +299,7 @@ func delete(t *testing.T, url string, wantStatus int) {
 // HTML content type, the expected mount point, and a no-cache header so an
 // upgraded binary takes effect on the next reload.
 func TestUIHandler_servesHTML(t *testing.T) {
-	srv := configMux(t, loadPools(t))
+	srv := uiMux(t)
 
 	resp, err := http.Get(srv.URL + "/_gateway/ui")
 	if err != nil {
@@ -324,7 +337,7 @@ func TestUIHandler_servesHTML(t *testing.T) {
 // TestUIHandler_methodNotAllowed confirms non-GET methods receive 405 with
 // an Allow header, matching the policy of the other /_gateway/* endpoints.
 func TestUIHandler_methodNotAllowed(t *testing.T) {
-	srv := configMux(t, loadPools(t))
+	srv := uiMux(t)
 
 	req, err := http.NewRequest("POST", srv.URL+"/_gateway/ui", nil)
 	if err != nil {
