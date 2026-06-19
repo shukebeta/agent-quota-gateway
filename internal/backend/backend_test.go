@@ -411,3 +411,375 @@ func TestContext_absent(t *testing.T) {
 		t.Error("FromContext on bare context returned ok=true")
 	}
 }
+
+func TestBuildFromSpec_parityWithEnv(t *testing.T) {
+	// A spec that matches the env config from TestLoadFrom_collectsAndNormalizes
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"AUTO": {
+				Members: map[string]MemberSpec{
+					"CLAUDE_A": {Credential: "cred-a"},
+					"CLAUDE_B": {Credential: "cred-b"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+
+	if got := reg.PoolNames(); !reflect.DeepEqual(got, []string{"auto"}) {
+		t.Fatalf("PoolNames() = %v, want [auto]", got)
+	}
+	if got := reg.PoolNicks("auto"); !reflect.DeepEqual(got, []string{"claude-a", "claude-b"}) {
+		t.Fatalf("PoolNicks(auto) = %v, want [claude-a claude-b]", got)
+	}
+
+	b, ok := reg.ResolveIn("auto", "claude-a")
+	if !ok {
+		t.Fatal("ResolveIn(auto, claude-a) not found")
+	}
+	want := Backend{Pool: "auto", Nick: "claude-a", Credential: "cred-a", BaseURL: testDefaultBaseURL}
+	if b != want {
+		t.Errorf("ResolveIn(auto, claude-a) = %+v, want %+v", b, want)
+	}
+	if b.QuotaKey() != "auto/claude-a" {
+		t.Errorf("QuotaKey() = %q, want auto/claude-a", b.QuotaKey())
+	}
+}
+
+func TestBuildFromSpec_multiplePools(t *testing.T) {
+	// Parity with TestLoadFrom_multiplePools
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"AUTO": {
+				Members: map[string]MemberSpec{
+					"A": {Credential: "sk-ant-oat-a"},
+				},
+			},
+			"API": {
+				Members: map[string]MemberSpec{
+					"K": {Credential: "sk-ant-api-k"},
+				},
+			},
+			"Z_AI": {
+				BaseURL: "https://open.example/anthropic",
+				Members: map[string]MemberSpec{
+					"X": {Credential: "zcred"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	if got := reg.PoolNames(); !reflect.DeepEqual(got, []string{"api", "auto", "z-ai"}) {
+		t.Fatalf("PoolNames() = %v, want [api auto z-ai]", got)
+	}
+	if b, _ := reg.ResolveIn("z-ai", "x"); b.BaseURL != "https://open.example/anthropic" {
+		t.Errorf("z-ai/x BaseURL = %q, want the pool default", b.BaseURL)
+	}
+	if b, _ := reg.ResolveIn("auto", "a"); b.BaseURL != testDefaultBaseURL {
+		t.Errorf("auto/a BaseURL = %q, want the gateway default", b.BaseURL)
+	}
+}
+
+func TestBuildFromSpec_perMemberURLOverride(t *testing.T) {
+	// Parity with TestLoadFrom_perMemberURLOverride
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"Z_AI": {
+				BaseURL: "https://primary.example/anthropic",
+				Members: map[string]MemberSpec{
+					"X": {Credential: "cred-x"},
+					"Y": {Credential: "cred-y", BaseURL: "https://mirror.example/anthropic"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	x, _ := reg.ResolveIn("z-ai", "x")
+	if x.Credential != "cred-x" || x.BaseURL != "https://primary.example/anthropic" {
+		t.Errorf("x = %+v, want cred-x at the pool default", x)
+	}
+	y, _ := reg.ResolveIn("z-ai", "y")
+	if y.Credential != "cred-y" || y.BaseURL != "https://mirror.example/anthropic" {
+		t.Errorf("y = %+v, want cred-y at the per-member override", y)
+	}
+}
+
+func TestBuildFromSpec_priorityParsed(t *testing.T) {
+	// Parity with TestLoadFrom_priorityParsed
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"CHN": {
+				Priority: []string{"ZAI", "M3"},
+				Members: map[string]MemberSpec{
+					"ZAI": {Credential: "cred-zai"},
+					"M3":  {Credential: "cred-m3"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	if got := reg.PoolPriority("chn"); !reflect.DeepEqual(got, []string{"zai", "m3"}) {
+		t.Errorf("PoolPriority(chn) = %v, want [zai m3]", got)
+	}
+}
+
+func TestBuildFromSpec_balanceParsed(t *testing.T) {
+	// Parity with TestLoadFrom_balanceParsed
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"SUB": {
+				Balance: "lead",
+				Members: map[string]MemberSpec{
+					"A": {Credential: "cred-a"},
+					"B": {Credential: "cred-b"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	if got := reg.PoolBalanceGap("sub"); got != defaultBalanceGap {
+		t.Errorf("PoolBalanceGap(sub) = %v, want default %v", got, defaultBalanceGap)
+	}
+	if got := reg.PoolBalanceDwell("sub"); got != defaultBalanceDwell {
+		t.Errorf("PoolBalanceDwell(sub) = %v, want default %v", got, defaultBalanceDwell)
+	}
+}
+
+func TestBuildFromSpec_balanceWithCustomTuning(t *testing.T) {
+	// Parity with TestLoadFrom_balanceWithCustomTuning
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"SUB": {
+				Balance:      "lead",
+				BalanceGap:   0.20,
+				BalanceDwell: Duration{D: 10 * time.Minute},
+				Members: map[string]MemberSpec{
+					"A": {Credential: "cred-a"},
+					"B": {Credential: "cred-b"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	if got := reg.PoolBalanceGap("sub"); got != 0.20 {
+		t.Errorf("PoolBalanceGap(sub) = %v, want 0.20", got)
+	}
+	if got := reg.PoolBalanceDwell("sub"); got != 10*time.Minute {
+		t.Errorf("PoolBalanceDwell(sub) = %v, want 10m", got)
+	}
+}
+
+func TestBuildFromSpec_caseInsensitive(t *testing.T) {
+	// Parity with TestResolveIn_caseInsensitive
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"Z_AI": {
+				Members: map[string]MemberSpec{
+					"CLAUDE_A": {Credential: "cred-a"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	for _, pool := range []string{"z-ai", "Z-AI", "  z-ai  ", "z_ai"} {
+		for _, nick := range []string{"claude-a", "CLAUDE-A", "claude_a"} {
+			if b, ok := reg.ResolveIn(pool, nick); !ok || b.Nick != "claude-a" || b.Pool != "z-ai" {
+				t.Errorf("ResolveIn(%q,%q) = (%+v,%v), want z-ai/claude-a", pool, nick, b, ok)
+			}
+		}
+	}
+}
+
+func TestBuildFromSpec_validatorTable(t *testing.T) {
+	cases := map[string]Spec{
+		"empty credential": {
+			Pools: map[string]PoolSpec{
+				"A": {Members: map[string]MemberSpec{"X": {Credential: ""}}},
+			},
+		},
+		"invalid balance mode": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					Balance: "round-robin",
+					Members: map[string]MemberSpec{"A": {Credential: "cred-a"}},
+				},
+			},
+		},
+		"non-positive gap": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					Balance:    "lead",
+					BalanceGap: -0.1,
+					Members:    map[string]MemberSpec{"A": {Credential: "cred-a"}},
+				},
+			},
+		},
+		"non-positive dwell": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					Balance:      "lead",
+					BalanceDwell: Duration{D: -1 * time.Second},
+					Members:      map[string]MemberSpec{"A": {Credential: "cred-a"}},
+				},
+			},
+		},
+		"gap without balance": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					BalanceGap: 0.15,
+					Members:    map[string]MemberSpec{"A": {Credential: "cred-a"}},
+				},
+			},
+		},
+		"dwell without balance": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					BalanceDwell: Duration{D: 5 * time.Minute},
+					Members:      map[string]MemberSpec{"A": {Credential: "cred-a"}},
+				},
+			},
+		},
+		"priority names non-member": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					Priority: []string{"ghost"},
+					Members: map[string]MemberSpec{
+						"A": {Credential: "cred-a"},
+						"B": {Credential: "cred-b"},
+					},
+				},
+			},
+		},
+		"priority + balance together": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					Priority: []string{"a"},
+					Balance:  "lead",
+					Members: map[string]MemberSpec{
+						"A": {Credential: "cred-a"},
+						"B": {Credential: "cred-b"},
+					},
+				},
+			},
+		},
+		"base URL on memberless pool": {
+			Pools: map[string]PoolSpec{
+				"GHOST": {
+					BaseURL: "https://ghost.example",
+				},
+				"OK": {
+					Members: map[string]MemberSpec{"A": {Credential: "cred-a"}},
+				},
+			},
+		},
+		"malformed base URL": {
+			Pools: map[string]PoolSpec{
+				"Z_AI": {
+					BaseURL: "not-a-url",
+					Members: map[string]MemberSpec{"X": {Credential: "cred"}},
+				},
+			},
+		},
+		"malformed per-member URL": {
+			Pools: map[string]PoolSpec{
+				"Z_AI": {
+					Members: map[string]MemberSpec{
+						"X": {Credential: "cred", BaseURL: "not-a-url"},
+					},
+				},
+			},
+		},
+		"no backends": {
+			Pools: map[string]PoolSpec{},
+		},
+		"empty pool name": {
+			Pools: map[string]PoolSpec{
+				"": {Members: map[string]MemberSpec{"X": {Credential: "cred"}}},
+			},
+		},
+		"empty member name": {
+			Pools: map[string]PoolSpec{
+				"A": {Members: map[string]MemberSpec{"": {Credential: "cred"}}},
+			},
+		},
+		"collision after normalization (same pool, different nick case)": {
+			Pools: map[string]PoolSpec{
+				"SUB": {
+					Members: map[string]MemberSpec{
+						"CLAUDA": {Credential: "cred-1"},
+						"clauda": {Credential: "cred-2"},
+					},
+				},
+			},
+		},
+		"collision after normalization (different pool case)": {
+			Pools: map[string]PoolSpec{
+				"SUB":  {Members: map[string]MemberSpec{"A": {Credential: "cred-1"}}},
+				"sub_": {Members: map[string]MemberSpec{"A": {Credential: "cred-2"}}},
+			},
+		},
+	}
+	for name, spec := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := BuildFromSpec(spec, testDefaultBaseURL)
+			if err == nil {
+				t.Errorf("expected error for case: %s", name)
+			}
+		})
+	}
+}
+
+func TestBuildFromSpec_duplicatePriorityNick(t *testing.T) {
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"SUB": {
+				Priority: []string{"a", "a"},
+				Members: map[string]MemberSpec{
+					"A": {Credential: "cred-a"},
+				},
+			},
+		},
+	}
+	_, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err == nil {
+		t.Error("expected error for duplicate priority nick")
+	}
+}
+
+func TestBuildFromSpec_emptyPriorityEntry(t *testing.T) {
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"SUB": {
+				Priority: []string{"a", ""},
+				Members: map[string]MemberSpec{
+					"A": {Credential: "cred-a"},
+				},
+			},
+		},
+	}
+	_, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err == nil {
+		t.Error("expected error for empty priority entry")
+	}
+}

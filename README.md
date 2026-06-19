@@ -66,12 +66,13 @@ Out of scope:
 
 - Non-Anthropic *protocols*.
 - Quota-watermark or concurrency-aware load spreading. A pool fails off a
-  member on a real `429`, or once the quota store reports its window **fully
-  consumed** (utilization `1.0` — the only exhaustion signal a poller-tracked
-  backend produces; see [Proprietary quota polling](#proprietary-quota-polling)).
-  It never pre-empts below `100%` (a member at 95% keeps serving, to maximize
-  prompt-cache retention) and never spreads concurrent requests across
-  accounts.
+  member on a real `429`, or once the quota store reports its window
+  **blocking** — a `rejected` status for an Anthropic backend, or (for a
+  poller-tracked backend, which reports no status) utilization `1.0`; see
+  [Proprietary quota polling](#proprietary-quota-polling). It never pre-empts
+  a member the upstream still serves (an Anthropic window at `1.0` with
+  `allowed_warning` keeps serving, to maximize prompt-cache retention) and
+  never spreads concurrent requests across accounts.
 - **Cross-pool fallback / manual pool switching** — e.g. "all
   subscription pools are exhausted, borrow the `api` pool for 30 minutes".
   Pools are independent here; choosing between them is the client's job
@@ -294,10 +295,89 @@ and `PRIORITY` both declared on the same pool, both `LISTEN_ADDR` and
 Tailscale ranges. A `|` in a credential is rejected because the tail must
 parse as a URL — tokens do not contain `|`.
 
-Pools live in the environment, not a file — the gateway never reads a
-credential from disk (see [Security model](#security-model)). If you
+Pools live in the environment by default — the gateway reads no credential
+from disk in that mode (see [Security model](#security-model)). If you
 prefer a `.env`, source it before launch (`set -a; . ./.env; set +a`) or
 use systemd `EnvironmentFile=` / a secret manager.
+
+## Config file
+
+As an alternative to environment variables, you can declare pools and gateway
+settings in a JSON config file. This is opt-in: the gateway uses env vars by
+default, and only reads a file when explicitly directed via `--config`,
+`AQG_CONFIG`, or by placing `aqg.json` in the working directory.
+
+**Precedence (highest to lowest):**
+
+1. `--config <path>` flag
+2. `AQG_CONFIG=<path>` environment variable
+3. `./aqg.json` in the current working directory
+4. Environment variables (the default)
+
+When a config file is used, the gateway follows an **all-or-nothing** rule:
+all pools and gateway settings must come from the file; env vars for pool
+configuration are ignored. (The env vars listed in the table below are only
+read when no config file is found.) A malformed file, an unknown JSON key,
+or a file with looser-than-0600 permissions causes startup to fail closed —
+no silent fallback to env.
+
+**File format:**
+
+```json
+{
+  "base_url": "https://api.anthropic.com",
+  "listen_addr": "127.0.0.1:8080",
+  "shared_listen_addr": "",
+  "state_file": "",
+  "pools": {
+    "<POOL>": {
+      "base_url": "<pool-default-upstream>",
+      "members": {
+        "<NICK>": {
+          "credential": "<real-credential>",
+          "base_url": "<optional-per-member-override>"
+        }
+      },
+      "priority": ["nick-a", "nick-b"],
+      "balance": "lead",
+      "balance_gap": 0.15,
+      "balance_dwell": "5m"
+    }
+  }
+}
+```
+
+**Env ↔ File mapping table:**
+
+| Env var | JSON path | Notes |
+|---------|-----------|-------|
+| `AQG_POOL_<P>_BACKEND_<N>` | `pools.<P>.members.<N>.credential` | Required. |
+| `AQG_POOL_<P>_BACKEND_<N>\|<URL>` | `pools.<P>.members.<N>.base_url` | Optional per-member override. |
+| `AQG_POOL_<P>_BASE_URL` | `pools.<P>.base_url` | Pool-level default. |
+| `AQG_POOL_<P>_PRIORITY` | `pools.<P>.priority` | Array of nicks, highest first. |
+| `AQG_POOL_<P>_BALANCE` | `pools.<P>.balance` | Set to `"lead"` for balanced routing. |
+| `AQG_POOL_<P>_BALANCE_GAP` | `pools.<P>.balance_gap` | Omit for the default (0.15). An explicit non-positive value is rejected. |
+| `AQG_POOL_<P>_BALANCE_DWELL` | `pools.<P>.balance_dwell` | Omit for the default (`5m`). An explicit non-positive value is rejected. |
+| `ANTHROPIC_BASE_URL` | `base_url` | Gateway default upstream. |
+| `LISTEN_ADDR` | `listen_addr` | Loopback-only bind address. |
+| `SHARED_LISTEN_ADDR` | `shared_listen_addr` | Tailscale bind address for shared mode. |
+| `AQG_STATE_FILE` | `state_file` | Path to persistent state file. |
+
+**Sample file:**
+
+A `aqg.sample.json` file is provided in the repository. Copy it to `aqg.json`,
+fill in real credentials, and set permissions:
+
+```bash
+cp aqg.sample.json aqg.json
+chmod 600 aqg.json   # required: gateway rejects looser permissions
+# Edit aqg.json with your real credentials
+./agent-quota-gateway   # or: --config aqg.json
+```
+
+The sample file contains placeholder credentials (`sk-ant-oat-PLACEHOLDER-*`);
+replace them with your real credentials. The repository gitignores `aqg.json`
+so your real file is never committed by default.
 
 ## Smoke test
 
@@ -503,9 +583,11 @@ guarantees that follow:
 - Request and response bodies are not logged, persisted, or inspected. The
   logging middleware records only `method`, `path`, `status`, `duration`,
   and a request ID.
-- Credentials live only in the process environment and in memory — the
-  gateway reads no credential file, so its "no on-disk state" posture
-  holds. How the environment is populated is the operator's choice.
+- Credentials live only in the process environment (or an opt-in,
+  operator-protected JSON config file at `0600` permissions) and in
+  memory — the gateway keeps zero credentials on disk by default, and the
+  file path is an explicit opt-in alternative to a `0600` `aqg.env`. How
+  the environment (or file) is populated is the operator's choice.
 - Quota snapshots, sticky pointers, and exhausted maps can optionally be
   persisted to a local state file (see `AQG_STATE_FILE` below) so state
   survives a restart. The file contains only quota utilization data and

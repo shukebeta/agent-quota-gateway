@@ -9,12 +9,13 @@
 //
 // Everything is a pool. There is no non-pool mode and no implicit
 // default pool: every backend is declared inside a named pool through
-// the process environment. A pool groups *interchangeable* backends —
-// same protocol, same quota semantics — so the auto-rotation that fronts
-// every pool can fail over between its members without changing the
-// observable model or quota behaviour. Backends are declared purely
-// through environment variables; there is no credential file, so the
-// gateway keeps its "no on-disk state" posture.
+// the process environment or an explicit, operator-protected (0600) JSON
+// config file. A pool groups *interchangeable* backends — same protocol,
+// same quota semantics — so the auto-rotation that fronts every pool can
+// fail over between its members without changing the observable model or
+// quota behaviour. The env path keeps zero credentials on disk; the file
+// path is an opt-in alternative for operators who prefer explicit
+// configuration.
 package backend
 
 import (
@@ -109,6 +110,61 @@ type Registry struct {
 	pools map[string]*pool
 }
 
+// Spec is the file-source representation of a pool configuration. It
+// maps pool names to their specs; values are validated by BuildFromSpec.
+// Fields match the JSON DTO shape; zero values for BalanceGap and
+// BalanceDwell are interpreted as "use the default" (not an error),
+// matching file semantics where omitting a key falls back to the default.
+// An explicit negative value is rejected.
+type Spec struct {
+	Pools map[string]PoolSpec
+}
+
+// PoolSpec is one pool's configuration as read from a file. Members are
+// keyed by nick (any string; normalized the same way env vars are).
+// Balance is the routing mode; only "lead" is supported. Priority is the
+// ordered preference list (highest first). BalanceGap and BalanceDwell
+// tune balanced routing; 0 means use the default.
+type PoolSpec struct {
+	BaseURL      string
+	Members      map[string]MemberSpec
+	Priority     []string
+	Balance      string
+	BalanceGap   float64
+	BalanceDwell Duration // Duration is a string wrapper for time.Duration parsing
+}
+
+// MemberSpec is one backend's credential and optional per-member base URL
+// override, as read from a file.
+type MemberSpec struct {
+	Credential string
+	BaseURL    string // empty means use the pool default
+}
+
+// Duration is a time.Duration serialized as a string (e.g. "5m"). It
+// implements json.Unmarshaler so JSON files use the same duration syntax
+// as env vars.
+type Duration struct {
+	D time.Duration
+}
+
+// UnmarshalJSON parses a duration string (e.g. "5m", "10s") into a Duration.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	s := string(b)
+	if s == "null" || s == `""` {
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	d.D = dur
+	return nil
+}
+
 // pool is one named, immutable set of interchangeable backends.
 type pool struct {
 	name   string
@@ -141,6 +197,135 @@ func Load(defaultBaseURL string) (*Registry, error) {
 	return loadFrom(os.Environ(), defaultBaseURL)
 }
 
+// BuildFromSpec builds a Registry from a Spec (file-source configuration),
+// using defaultBaseURL for any pool that does not declare its own.
+// Pool and member names are normalized the same way env vars are.
+// Returns an error if the spec is invalid (empty credential, invalid
+// balance mode, collision after normalization, etc.).
+func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
+	p := parsed{
+		poolBaseURL:            make(map[string]string),
+		poolURLOrigin:          make(map[string]string),
+		poolPriority:           make(map[string][]string),
+		poolPriorityOrigin:     make(map[string]string),
+		poolBalance:            make(map[string]string),
+		poolBalanceOrigin:      make(map[string]string),
+		poolBalanceGap:         make(map[string]float64),
+		poolBalanceGapOrigin:   make(map[string]string),
+		poolBalanceDwell:       make(map[string]time.Duration),
+		poolBalanceDwellOrigin: make(map[string]string),
+		originKey:              make(map[string]string),
+	}
+
+	// Detect duplicate pool names after normalization and normalize all pool names.
+	// map[original]normalized, for collision detection.
+	normalizedPools := make(map[string]string, len(spec.Pools))
+	for poolKey := range spec.Pools {
+		norm := normalizeName(poolKey)
+		if norm == "" {
+			return nil, fmt.Errorf("backend: pool name %q is empty after normalization", poolKey)
+		}
+		if prev, dup := normalizedPools[poolKey]; dup {
+			return nil, fmt.Errorf("backend: pool keys %q and %q both normalize to %q", prev, poolKey, norm)
+		}
+		// Check for collision with already-normalized name
+		for origKey, origNorm := range normalizedPools {
+			if origNorm == norm && origKey != poolKey {
+				return nil, fmt.Errorf("backend: pool keys %q and %q both normalize to %q", origKey, poolKey, norm)
+			}
+		}
+		normalizedPools[poolKey] = norm
+	}
+
+	// Process each pool.
+	for poolKey, poolSpec := range spec.Pools {
+		poolName := normalizedPools[poolKey]
+
+		// Normalize member nicks and detect collisions within the pool.
+		normalizedNicks := make(map[string]string, len(poolSpec.Members))
+		for nickKey := range poolSpec.Members {
+			norm := normalizeName(nickKey)
+			if norm == "" {
+				return nil, fmt.Errorf("backend: pool %q: member name %q is empty after normalization", poolKey, nickKey)
+			}
+			if prev, dup := normalizedNicks[nickKey]; dup {
+				return nil, fmt.Errorf("backend: pool %q: member keys %q and %q both normalize to %q", poolKey, prev, nickKey, norm)
+			}
+			// Check for collision with already-normalized nick
+			for origKey, origNorm := range normalizedNicks {
+				if origNorm == norm && origKey != nickKey {
+					return nil, fmt.Errorf("backend: pool %q: member keys %q and %q both normalize to %q", poolKey, origKey, nickKey, norm)
+				}
+			}
+			normalizedNicks[nickKey] = norm
+		}
+
+		// Base URL: pool-level default.
+		if poolSpec.BaseURL != "" {
+			p.poolBaseURL[poolName] = poolSpec.BaseURL
+			p.poolURLOrigin[poolName] = fmt.Sprintf("pools.%s.base_url", poolKey)
+		}
+
+		// Members.
+		for nickKey, memberSpec := range poolSpec.Members {
+			nick := normalizedNicks[nickKey]
+			qkey := poolName + "/" + nick
+			if _, dup := p.originKey[qkey]; dup {
+				return nil, fmt.Errorf("backend: pool %q nick %q is declared more than once", poolKey, nickKey)
+			}
+			origin := fmt.Sprintf("pools.%s.members.%s", poolKey, nickKey)
+			p.originKey[qkey] = origin
+			p.members = append(p.members, rawMember{
+				pool:        poolName,
+				nick:        nick,
+				cred:        memberSpec.Credential,
+				urlOverride: memberSpec.BaseURL,
+				originKey:   origin,
+			})
+		}
+
+		// Priority.
+		if len(poolSpec.Priority) > 0 {
+			order := make([]string, 0, len(poolSpec.Priority))
+			seen := make(map[string]bool, len(poolSpec.Priority))
+			for _, raw := range poolSpec.Priority {
+				norm := normalizeName(raw)
+				if norm == "" {
+					return nil, fmt.Errorf("backend: pool %q: priority entry %q is empty after normalization", poolKey, raw)
+				}
+				if seen[norm] {
+					return nil, fmt.Errorf("backend: pool %q: priority lists nick %q more than once", poolKey, norm)
+				}
+				seen[norm] = true
+				order = append(order, norm)
+			}
+			p.poolPriority[poolName] = order
+			p.poolPriorityOrigin[poolName] = fmt.Sprintf("pools.%s.priority", poolKey)
+		}
+
+		// Balance.
+		if poolSpec.Balance != "" {
+			p.poolBalance[poolName] = poolSpec.Balance
+			p.poolBalanceOrigin[poolName] = fmt.Sprintf("pools.%s.balance", poolKey)
+		}
+
+		// BalanceGap: non-zero (including negative) gets recorded for validation.
+		// Zero (absent in JSON) means "use default".
+		if poolSpec.BalanceGap != 0 {
+			p.poolBalanceGap[poolName] = poolSpec.BalanceGap
+			p.poolBalanceGapOrigin[poolName] = fmt.Sprintf("pools.%s.balance_gap", poolKey)
+		}
+
+		// BalanceDwell: non-zero gets recorded. Zero (absent) means "use default".
+		if poolSpec.BalanceDwell.D != 0 {
+			p.poolBalanceDwell[poolName] = poolSpec.BalanceDwell.D
+			p.poolBalanceDwellOrigin[poolName] = fmt.Sprintf("pools.%s.balance_dwell", poolKey)
+		}
+	}
+
+	return buildRegistry(defaultBaseURL, p)
+}
+
 // rawMember is a parsed member declaration before its base URL is
 // resolved (the pool default may appear later in the environ scan).
 type rawMember struct {
@@ -151,27 +336,45 @@ type rawMember struct {
 	originKey   string // the env var, for collision/error messages
 }
 
+// parsed bundles the syntactic output of an env scan or file spec,
+// before semantic validation. All string slices and maps are populated
+// during the syntactic pass; buildRegistry consumes them to produce
+// a Registry.
+type parsed struct {
+	members                []rawMember
+	originKey              map[string]string // pool/nick -> origin key for errors
+	poolBaseURL            map[string]string // pool -> declared default upstream
+	poolURLOrigin          map[string]string // pool -> origin of base URL
+	poolPriority           map[string][]string
+	poolPriorityOrigin     map[string]string
+	poolBalance            map[string]string
+	poolBalanceOrigin      map[string]string
+	poolBalanceGap         map[string]float64
+	poolBalanceGapOrigin   map[string]string
+	poolBalanceDwell       map[string]time.Duration
+	poolBalanceDwellOrigin map[string]string
+}
+
 // loadFrom is Load's testable core: it takes "KEY=VALUE" entries in the
 // same shape as os.Environ().
 //
-// It fails closed: a malformed key, an empty credential/nick/pool, a
-// collision, a base URL on a pool with no members, a malformed upstream
-// URL, or no pools at all are all startup errors rather than a gateway
-// that silently can't route. Credential values are never echoed in an
-// error.
+// It performs syntactic parsing only (splitting credentials, parsing
+// float/duration strings, normalization, duplicate detection). All
+// semantic validation is delegated to buildRegistry.
 func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
-	poolBaseURL := make(map[string]string) // pool -> declared default upstream
-	poolURLOrigin := make(map[string]string)
-	poolPriority := make(map[string][]string) // pool -> declared preference order
-	poolPriorityOrigin := make(map[string]string)
-	poolBalance := make(map[string]string)        // pool -> "lead"
-	poolBalanceOrigin := make(map[string]string)   // pool -> env key, for errors
-	poolBalanceGap := make(map[string]float64)     // pool -> gap fraction
-	poolBalanceGapOrigin := make(map[string]string)
-	poolBalanceDwell := make(map[string]time.Duration) // pool -> dwell duration
-	poolBalanceDwellOrigin := make(map[string]string)
-	var members []rawMember
-	originKey := make(map[string]string) // pool/nick -> env var that produced it
+	p := parsed{
+		poolBaseURL:            make(map[string]string),
+		poolURLOrigin:          make(map[string]string),
+		poolPriority:           make(map[string][]string),
+		poolPriorityOrigin:     make(map[string]string),
+		poolBalance:            make(map[string]string),
+		poolBalanceOrigin:      make(map[string]string),
+		poolBalanceGap:         make(map[string]float64),
+		poolBalanceGapOrigin:   make(map[string]string),
+		poolBalanceDwell:       make(map[string]time.Duration),
+		poolBalanceDwellOrigin: make(map[string]string),
+		originKey:              make(map[string]string),
+	}
 
 	for _, kv := range environ {
 		eq := strings.IndexByte(kv, '=')
@@ -200,11 +403,11 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 				return nil, fmt.Errorf("backend: %s %w", key, err)
 			}
 			qkey := poolName + "/" + nick
-			if prev, dup := originKey[qkey]; dup {
+			if prev, dup := p.originKey[qkey]; dup {
 				return nil, fmt.Errorf("backend: %s and %s both map to pool %q nick %q", prev, key, poolName, nick)
 			}
-			originKey[qkey] = key
-			members = append(members, rawMember{
+			p.originKey[qkey] = key
+			p.members = append(p.members, rawMember{
 				pool:        poolName,
 				nick:        nick,
 				cred:        cred,
@@ -222,11 +425,11 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			if val == "" {
 				return nil, fmt.Errorf("backend: %s has an empty base URL", key)
 			}
-			if prev, dup := poolURLOrigin[poolName]; dup {
+			if prev, dup := p.poolURLOrigin[poolName]; dup {
 				return nil, fmt.Errorf("backend: %s and %s both set the base URL for pool %q", prev, key, poolName)
 			}
-			poolURLOrigin[poolName] = key
-			poolBaseURL[poolName] = val
+			p.poolURLOrigin[poolName] = key
+			p.poolBaseURL[poolName] = val
 			continue
 		}
 
@@ -235,15 +438,15 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			if poolName == "" {
 				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
 			}
-			if prev, dup := poolPriorityOrigin[poolName]; dup {
+			if prev, dup := p.poolPriorityOrigin[poolName]; dup {
 				return nil, fmt.Errorf("backend: %s and %s both set the priority for pool %q", prev, key, poolName)
 			}
 			order, err := parsePriority(val)
 			if err != nil {
 				return nil, fmt.Errorf("backend: %s %w", key, err)
 			}
-			poolPriorityOrigin[poolName] = key
-			poolPriority[poolName] = order
+			p.poolPriorityOrigin[poolName] = key
+			p.poolPriority[poolName] = order
 			continue
 		}
 
@@ -256,15 +459,16 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			if poolName == "" {
 				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
 			}
-			if prev, dup := poolBalanceGapOrigin[poolName]; dup {
+			if prev, dup := p.poolBalanceGapOrigin[poolName]; dup {
 				return nil, fmt.Errorf("backend: %s and %s both set the balance gap for pool %q", prev, key, poolName)
 			}
 			f, err := strconv.ParseFloat(val, 64)
-			if err != nil || f <= 0 {
+			if err != nil {
 				return nil, fmt.Errorf("backend: %s must be a positive fraction (e.g. 0.15)", key)
 			}
-			poolBalanceGapOrigin[poolName] = key
-			poolBalanceGap[poolName] = f
+			// Syntactic ParseFloat only; positivity check is in buildRegistry
+			p.poolBalanceGapOrigin[poolName] = key
+			p.poolBalanceGap[poolName] = f
 			continue
 		}
 
@@ -273,15 +477,16 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			if poolName == "" {
 				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
 			}
-			if prev, dup := poolBalanceDwellOrigin[poolName]; dup {
+			if prev, dup := p.poolBalanceDwellOrigin[poolName]; dup {
 				return nil, fmt.Errorf("backend: %s and %s both set the balance dwell for pool %q", prev, key, poolName)
 			}
 			d, err := time.ParseDuration(val)
-			if err != nil || d <= 0 {
+			if err != nil {
 				return nil, fmt.Errorf("backend: %s must be a positive duration (e.g. 5m)", key)
 			}
-			poolBalanceDwellOrigin[poolName] = key
-			poolBalanceDwell[poolName] = d
+			// Syntactic ParseDuration only; positivity check is in buildRegistry
+			p.poolBalanceDwellOrigin[poolName] = key
+			p.poolBalanceDwell[poolName] = d
 			continue
 		}
 
@@ -290,28 +495,46 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			if poolName == "" {
 				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
 			}
-			if val != "lead" {
-				return nil, fmt.Errorf("backend: %s: unsupported balance mode %q; only \"lead\" is supported", key, val)
-			}
-			if prev, dup := poolBalanceOrigin[poolName]; dup {
+			// Syntactic check only; valid values enforced in buildRegistry
+			if prev, dup := p.poolBalanceOrigin[poolName]; dup {
 				return nil, fmt.Errorf("backend: %s and %s both set the balance mode for pool %q", prev, key, poolName)
 			}
-			poolBalanceOrigin[poolName] = key
-			poolBalance[poolName] = val
+			p.poolBalanceOrigin[poolName] = key
+			p.poolBalance[poolName] = val
 			continue
 		}
 
 		return nil, fmt.Errorf("backend: %s is not a recognised AQG_POOL_ key (expected suffixes: _BASE_URL, _BACKEND_<NICK>, _PRIORITY, _BALANCE, _BALANCE_GAP, _BALANCE_DWELL)", key)
 	}
 
-	if len(members) == 0 {
-		return nil, fmt.Errorf("backend: no backends configured; set at least one %s<POOL>%s<NICK>", EnvPrefix, backendInfix)
+	return buildRegistry(defaultBaseURL, p)
+}
+
+// buildRegistry is the single semantic validation core shared by both
+// env and file paths. It consumes a parsed struct (produced by loadFrom
+// for env, or synthesized in BuildFromSpec for files) and returns a
+// fully validated Registry, or an error.
+//
+// All semantic checks live here: empty credential, invalid balance mode,
+// non-positive gap/dwell, base URL validity, memberless-pool base URL,
+// priority names a non-member, gap/dwell without balance, priority+balance
+// exclusion.
+func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
+	if len(p.members) == 0 {
+		return nil, fmt.Errorf("backend: no backends configured")
+	}
+
+	// Check empty credentials and normalize member origins for errors
+	for i := range p.members {
+		if p.members[i].cred == "" {
+			return nil, fmt.Errorf("backend: %s has an empty credential", p.members[i].originKey)
+		}
 	}
 
 	pools := make(map[string]*pool)
-	for _, m := range members {
+	for _, m := range p.members {
 		raw := defaultBaseURL
-		if u, ok := poolBaseURL[m.pool]; ok {
+		if u, ok := p.poolBaseURL[m.pool]; ok {
 			raw = u
 		}
 		if m.urlOverride != "" {
@@ -321,12 +544,12 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("backend: %s has an invalid base URL: %w", m.originKey, err)
 		}
-		p := pools[m.pool]
-		if p == nil {
-			p = &pool{name: m.pool, byNick: make(map[string]Backend)}
-			pools[m.pool] = p
+		pl := pools[m.pool]
+		if pl == nil {
+			pl = &pool{name: m.pool, byNick: make(map[string]Backend)}
+			pools[m.pool] = pl
 		}
-		p.byNick[m.nick] = Backend{
+		pl.byNick[m.nick] = Backend{
 			Pool:       m.pool,
 			Nick:       m.nick,
 			Credential: m.cred,
@@ -336,86 +559,102 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 
 	// A base URL declared for a pool with no members is almost certainly a
 	// typo'd nick; fail closed rather than silently ignore it.
-	for poolName, origin := range poolURLOrigin {
+	for poolName, origin := range p.poolURLOrigin {
 		if _, ok := pools[poolName]; !ok {
 			return nil, fmt.Errorf("backend: %s sets a base URL for pool %q, which has no backends", origin, poolName)
+		}
+	}
+
+	// Validate balance mode values
+	for poolName, mode := range p.poolBalance {
+		if mode != "lead" {
+			return nil, fmt.Errorf("backend: %s: unsupported balance mode %q; only \"lead\" is supported", p.poolBalanceOrigin[poolName], mode)
+		}
+	}
+
+	// Validate non-positive gap/dwell
+	for poolName, gap := range p.poolBalanceGap {
+		if gap <= 0 {
+			return nil, fmt.Errorf("backend: %s must be a positive fraction (e.g. 0.15)", p.poolBalanceGapOrigin[poolName])
+		}
+	}
+	for poolName, dwell := range p.poolBalanceDwell {
+		if dwell <= 0 {
+			return nil, fmt.Errorf("backend: %s must be a positive duration (e.g. 5m)", p.poolBalanceDwellOrigin[poolName])
 		}
 	}
 
 	// A priority list must name a real pool and only real members of it.
 	// Fail closed on a typo'd pool or nick rather than silently routing by
 	// a misspelled preference.
-	for poolName, order := range poolPriority {
-		p, ok := pools[poolName]
+	for poolName, order := range p.poolPriority {
+		pool, ok := pools[poolName]
 		if !ok {
-			return nil, fmt.Errorf("backend: %s sets a priority for pool %q, which has no backends", poolPriorityOrigin[poolName], poolName)
+			return nil, fmt.Errorf("backend: %s sets a priority for pool %q, which has no backends", p.poolPriorityOrigin[poolName], poolName)
 		}
 		for _, nick := range order {
-			if _, ok := p.byNick[nick]; !ok {
-				return nil, fmt.Errorf("backend: %s lists nick %q, which is not a member of pool %q", poolPriorityOrigin[poolName], nick, poolName)
+			if _, ok := pool.byNick[nick]; !ok {
+				return nil, fmt.Errorf("backend: %s lists nick %q, which is not a member of pool %q", p.poolPriorityOrigin[poolName], nick, poolName)
 			}
 		}
-		p.priority = order
+		pool.priority = order
 	}
 
 	// BALANCE_GAP and BALANCE_DWELL without BALANCE are configuration errors
 	// (most likely a misspelling of the pool name or a leftover setting).
-	for poolName, origin := range poolBalanceGapOrigin {
-		if _, ok := poolBalance[poolName]; !ok {
+	for poolName, origin := range p.poolBalanceGapOrigin {
+		if _, ok := p.poolBalance[poolName]; !ok {
 			return nil, fmt.Errorf("backend: %s sets a balance gap for pool %q but %s%s%s is not set",
 				origin, poolName, EnvPrefix, strings.ToUpper(poolName), balanceSuffix)
 		}
 	}
-	for poolName, origin := range poolBalanceDwellOrigin {
-		if _, ok := poolBalance[poolName]; !ok {
+	for poolName, origin := range p.poolBalanceDwellOrigin {
+		if _, ok := p.poolBalance[poolName]; !ok {
 			return nil, fmt.Errorf("backend: %s sets a balance dwell for pool %q but %s%s%s is not set",
 				origin, poolName, EnvPrefix, strings.ToUpper(poolName), balanceSuffix)
 		}
 	}
 
-	for poolName, mode := range poolBalance {
-		p, ok := pools[poolName]
+	for poolName, mode := range p.poolBalance {
+		pool, ok := pools[poolName]
 		if !ok {
-			return nil, fmt.Errorf("backend: %s sets balance mode for pool %q, which has no backends", poolBalanceOrigin[poolName], poolName)
+			return nil, fmt.Errorf("backend: %s sets balance mode for pool %q, which has no backends", p.poolBalanceOrigin[poolName], poolName)
 		}
-		if len(p.priority) > 0 {
+		if len(pool.priority) > 0 {
 			return nil, fmt.Errorf("backend: pool %q declares both %s and %s; balanced mode and priority routing are mutually exclusive",
-				poolName, poolBalanceOrigin[poolName], poolPriorityOrigin[poolName])
+				poolName, p.poolBalanceOrigin[poolName], p.poolPriorityOrigin[poolName])
 		}
-		p.balance = mode
-		if gap, ok := poolBalanceGap[poolName]; ok {
-			p.balanceGap = gap
+		pool.balance = mode
+		if gap, ok := p.poolBalanceGap[poolName]; ok {
+			pool.balanceGap = gap
 		} else {
-			p.balanceGap = defaultBalanceGap
+			pool.balanceGap = defaultBalanceGap
 		}
-		if dwell, ok := poolBalanceDwell[poolName]; ok {
-			p.balanceDwell = dwell
+		if dwell, ok := p.poolBalanceDwell[poolName]; ok {
+			pool.balanceDwell = dwell
 		} else {
-			p.balanceDwell = defaultBalanceDwell
+			pool.balanceDwell = defaultBalanceDwell
 		}
 	}
 
-	for _, p := range pools {
-		p.nicks = make([]string, 0, len(p.byNick))
-		for nick := range p.byNick {
-			p.nicks = append(p.nicks, nick)
+	for _, pool := range pools {
+		pool.nicks = make([]string, 0, len(pool.byNick))
+		for nick := range pool.byNick {
+			pool.nicks = append(pool.nicks, nick)
 		}
-		sort.Strings(p.nicks)
+		sort.Strings(pool.nicks)
 	}
 	return &Registry{pools: pools}, nil
 }
 
 // splitCredURL splits a member value into its credential and an optional
 // base-URL override. The override is everything after the first
-// separator byte. An empty credential is an error.
+// separator byte. The empty-credential check is in buildRegistry.
 func splitCredURL(val string) (cred, override string, err error) {
 	cred = val
 	if i := strings.IndexByte(val, credURLSep); i >= 0 {
 		cred = val[:i]
 		override = val[i+1:]
-	}
-	if cred == "" {
-		return "", "", fmt.Errorf("has an empty credential")
 	}
 	return cred, override, nil
 }

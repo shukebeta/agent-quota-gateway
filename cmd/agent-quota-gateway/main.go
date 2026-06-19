@@ -18,6 +18,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
+	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/persist"
 	"github.com/shukebeta/agent-quota-gateway/internal/poller"
@@ -38,26 +39,39 @@ var version = "dev"
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
+	configPath := flag.String("config", "", "path to a JSON config file (overrides AQG_CONFIG and ./aqg.json)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
 		return
 	}
-	if err := run(); err != nil {
+	if err := run(*configPath); err != nil {
 		fmt.Fprintf(os.Stderr, "agent-quota-gateway: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("config: %w", err)
-	}
+func run(configFlag string) error {
+	var cfg config.Config
+	var registry *backend.Registry
+	var err error
 
-	registry, err := backend.Load(cfg.AnthropicBaseURL)
-	if err != nil {
-		return fmt.Errorf("backend: %w", err)
+	// Check for config file first: flag > AQG_CONFIG > ./aqg.json > env.
+	if path, useFile := configfile.Resolve(configFlag); useFile {
+		cfg, registry, err = configfile.LoadFile(path)
+		if err != nil {
+			return err
+		}
+	} else {
+		cfg, err = config.Load()
+		if err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+
+		registry, err = backend.Load(cfg.AnthropicBaseURL)
+		if err != nil {
+			return fmt.Errorf("backend: %w", err)
+		}
 	}
 
 	store := quota.NewStore()
