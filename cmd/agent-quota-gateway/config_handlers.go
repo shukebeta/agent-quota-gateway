@@ -107,7 +107,7 @@ func enableMemberHandler(pools *auto.Pools) http.HandlerFunc {
 // addMemberRequest is the JSON request body for adding a pool member.
 type addMemberRequest struct {
 	Credential string `json:"credential"` // required
-	BaseURL    string `json:"base_url"`  // optional
+	BaseURL    string `json:"base_url"`   // optional
 }
 
 // addMemberHandler serves POST /_gateway/pool/{name}/member/{nick} —

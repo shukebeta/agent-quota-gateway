@@ -115,10 +115,10 @@ func Load() (Config, error) {
 	}
 
 	inputs := Inputs{
-		AnthropicBaseURL:  getEnv(EnvAnthropicBaseURL, DefaultBaseURL),
-		ListenAddr:        getEnv(EnvListenAddr, DefaultListenAddr),
-		SharedListenAddr:  shared,
-		StateFile:         resolveStateFile(),
+		AnthropicBaseURL: getEnv(EnvAnthropicBaseURL, DefaultBaseURL),
+		ListenAddr:       getEnv(EnvListenAddr, DefaultListenAddr),
+		SharedListenAddr: shared,
+		StateFile:        resolveStateFile(),
 	}
 	// Build's mutual-exclusion check uses non-emptiness, so we must
 	// pass empty for the unset listen knob to avoid a false positive.

@@ -8,7 +8,7 @@
 .env.*
 
 # Config file (real one, not the sample)
-aqg.json
+/aqg.json
 
 # Build outputs
 bin/

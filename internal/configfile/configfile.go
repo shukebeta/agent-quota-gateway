@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
@@ -83,10 +82,10 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 
 	// Map DTO to config.Inputs.
 	cfgInputs := config.Inputs{
-		AnthropicBaseURL:  dto.BaseURL,
-		ListenAddr:        dto.ListenAddr,
-		SharedListenAddr:  dto.SharedListenAddr,
-		StateFile:         dto.StateFile,
+		AnthropicBaseURL: dto.BaseURL,
+		ListenAddr:       dto.ListenAddr,
+		SharedListenAddr: dto.SharedListenAddr,
+		StateFile:        dto.StateFile,
 	}
 	cfg, err := config.Build(cfgInputs)
 	if err != nil {
@@ -97,11 +96,11 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 	spec := backend.Spec{Pools: make(map[string]backend.PoolSpec, len(dto.Pools))}
 	for poolKey, poolDTO := range dto.Pools {
 		poolSpec := backend.PoolSpec{
-			BaseURL:  poolDTO.BaseURL,
-			Members:  make(map[string]backend.MemberSpec, len(poolDTO.Members)),
-			Priority: poolDTO.Priority,
-			Balance:  poolDTO.Balance,
-			BalanceGap: poolDTO.BalanceGap,
+			BaseURL:      poolDTO.BaseURL,
+			Members:      make(map[string]backend.MemberSpec, len(poolDTO.Members)),
+			Priority:     poolDTO.Priority,
+			Balance:      poolDTO.Balance,
+			BalanceGap:   poolDTO.BalanceGap,
 			BalanceDwell: backend.Duration{D: poolDTO.BalanceDwell.D},
 		}
 		for nickKey, memberDTO := range poolDTO.Members {
@@ -143,40 +142,16 @@ type fileDTO struct {
 
 // poolDTO is one pool's configuration from the file.
 type poolDTO struct {
-	BaseURL      string                   `json:"base_url"`
-	Members      map[string]memberDTO     `json:"members"`
-	Priority     []string                 `json:"priority"`
-	Balance      string                   `json:"balance"`
-	BalanceGap   float64                  `json:"balance_gap"`
-	BalanceDwell durationString           `json:"balance_dwell"`
+	BaseURL      string               `json:"base_url"`
+	Members      map[string]memberDTO `json:"members"`
+	Priority     []string             `json:"priority"`
+	Balance      string               `json:"balance"`
+	BalanceGap   float64              `json:"balance_gap"`
+	BalanceDwell backend.Duration     `json:"balance_dwell"`
 }
 
 // memberDTO is one backend's credential and optional base URL override.
 type memberDTO struct {
 	Credential string `json:"credential"`
 	BaseURL    string `json:"base_url"`
-}
-
-// durationString is a time.Duration serialized as a string (e.g. "5m").
-// It implements json.Unmarshaler directly in the DTO so the JSON can use
-// the same duration syntax as env vars.
-type durationString struct {
-	D time.Duration
-}
-
-// UnmarshalJSON parses a duration string (e.g. "5m", "10s") into a durationString.
-func (d *durationString) UnmarshalJSON(b []byte) error {
-	s := string(b)
-	if s == "null" || s == `""` {
-		return nil
-	}
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		s = s[1 : len(s)-1]
-	}
-	dur, err := time.ParseDuration(s)
-	if err != nil {
-		return err
-	}
-	d.D = dur
-	return nil
 }

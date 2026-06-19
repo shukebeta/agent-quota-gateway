@@ -312,28 +312,113 @@ func filterPools(pools []string, keep string) []string {
 }
 
 func TestLoadFile_noCredentialInError(t *testing.T) {
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.json")
+	// Sentinel credential that must never appear in error messages.
+	// If a future change introduces input-echo behavior in errors, this
+	// test will fail loud.
+	const sentinelCred = "sk-ant-oat-LEAKCANARY-7Q3K"
 
-	// Use a placeholder credential; verify it doesn't appear in errors
-	content := `{
-		"pools": {
-			"auto": {
-				"members": {
-					"a": {"credential": "sk-ant-oat-PLACEHOLDER"}
+	t.Run("bad permissions", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.json")
+
+		content := `{
+			"pools": {
+				"auto": {
+					"members": {
+						"a": {"credential": "` + sentinelCred + `"}
+					}
 				}
 			}
+		}`
+
+		if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
 		}
-	}`
 
-	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
-		t.Fatal(err)
-	}
+		_, _, err := LoadFile(configPath)
+		if err == nil {
+			t.Fatal("LoadFile with 0644 should fail")
+		}
+		if !strings.Contains(err.Error(), "0600") {
+			t.Errorf("error should mention 0600 requirement; got: %v", err)
+		}
+		if strings.Contains(err.Error(), sentinelCred) {
+			t.Errorf("error message contains credential value: %v", err)
+		}
+	})
 
-	_, _, err := LoadFile(configPath)
-	// This should succeed (no error), but if it did fail, the error
-	// shouldn't contain the credential.
-	if err != nil && strings.Contains(err.Error(), "sk-ant-oat-PLACEHOLDER") {
-		t.Error("error message contains credential value")
-	}
+	t.Run("malformed JSON", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.json")
+
+		// Malformed JSON with credential embedded
+		content := `{"pools":{"auto":{"members":{"a":{"credential":"` + sentinelCred + `"}}}`
+		if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		_, _, err := LoadFile(configPath)
+		if err == nil {
+			t.Fatal("LoadFile with malformed JSON should fail")
+		}
+		if strings.Contains(err.Error(), sentinelCred) {
+			t.Errorf("error message contains credential value: %v", err)
+		}
+	})
+
+	t.Run("unknown field", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.json")
+
+		content := `{
+			"pools": {
+				"auto": {
+					"members": {
+						"a": {"credential": "` + sentinelCred + `"}
+					},
+					"unknown_field": "x"
+				}
+			}
+		}`
+
+		if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		_, _, err := LoadFile(configPath)
+		if err == nil {
+			t.Fatal("LoadFile with unknown field should fail")
+		}
+		if strings.Contains(err.Error(), sentinelCred) {
+			t.Errorf("error message contains credential value: %v", err)
+		}
+	})
+
+	t.Run("invalid balance mode", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.json")
+
+		content := `{
+			"pools": {
+				"auto": {
+					"members": {
+						"a": {"credential": "` + sentinelCred + `"}
+					},
+					"balance": "round-robin"
+				}
+			}
+		}`
+
+		if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		_, _, err := LoadFile(configPath)
+		if err == nil {
+			t.Fatal("LoadFile with invalid balance mode should fail")
+		}
+		if strings.Contains(err.Error(), sentinelCred) {
+			t.Errorf("error message contains credential value: %v", err)
+		}
+	})
 }
