@@ -450,9 +450,10 @@ func TestUIHandler_methodNotAllowed(t *testing.T) {
 // strings are matched case-sensitively, so a differently-cased reference
 // (e.g. "Credential:") still trips the case-insensitive regex.
 var allowedCredentialRefs = []string{
-	"'credential'",           // the add-form field name + placeholder (set via mkInput)
-	"credential:",            // the POST body key
-	"credential is required", // the client-side validation message naming the field
+	"'credential'",            // the add-form field name (set via mkInput)
+	"'credential (optional)'", // the add-form placeholder naming the optional field
+	"credential:",             // the POST body key
+	"credential is required",  // the client-side validation message naming the field
 }
 
 // scanForForbiddenSecret strips the JS contract comment and the allowlisted

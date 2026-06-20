@@ -276,16 +276,24 @@
   }
   button.move:hover { border-color: var(--accent); color: var(--accent); }
 
+  .addsub-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
+    padding: 12px 16px;
+  }
+  .addsub-card h2 { margin: 0 0 10px; font-size: 15px; font-family: var(--mono); }
+
   form.add-member {
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px dashed var(--border);
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
     align-items: center;
   }
-  form.add-member input {
+  form.add-member input,
+  form.add-member select {
     flex: 1 1 120px;
     min-width: 0;
     padding: 5px 8px;
@@ -296,7 +304,8 @@
     font-family: var(--mono);
     font-size: 12px;
   }
-  form.add-member input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  form.add-member input:focus,
+  form.add-member select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
   form.add-member button {
     flex: 0 0 auto;
     border: 1px solid var(--accent);
@@ -327,6 +336,7 @@
 </header>
 <main>
   <div id="banner" role="alert"></div>
+  <div id="addsub"></div>
   <div id="pools"></div>
 </main>
 <footer class="bottom">
@@ -473,12 +483,6 @@
     h3m.textContent = 'Members';
     colMem.appendChild(h3m);
     colMem.appendChild(renderMembers(view));
-    // Add-subscription is offered only on plain pools: priority and balanced
-    // selection iterate the static member set, so a runtime-added member in
-    // those pools would be unselectable. (Priority-pool add is #83/follow-up.)
-    if (!isBalanced(view) && view.priority.length === 0) {
-      colMem.appendChild(renderAddMember(view));
-    }
     cols.appendChild(colMem);
 
     section.appendChild(cols);
@@ -714,17 +718,44 @@
     return el;
   }
 
-  function renderAddMember(view) {
+  // renderAddSubscription builds the single standalone Add-subscription form
+  // (outside the pool boxes) into #addsub, rebuilt on each renderAll so the
+  // target-pool dropdown stays in sync. It targets any existing pool; "New
+  // pool" requires runtime pool creation (#104) and is intentionally absent.
+  function renderAddSubscription(views) {
+    var host = document.getElementById('addsub');
+    if (!host) { return; }
+    host.innerHTML = '';
+    if (!views || !views.length) { return; }
+
+    var section = document.createElement('section');
+    section.className = 'addsub-card';
+
+    var h2 = document.createElement('h2');
+    h2.textContent = 'Add subscription';
+    section.appendChild(h2);
+
     var form = document.createElement('form');
     form.className = 'add-member';
     form.setAttribute('data-role', 'add-member');
 
     var nick = mkInput('text', 'nick', 'nick');
     var base = mkInput('text', 'base_url', 'base_url (optional)');
-    var cred = mkInput('password', 'credential', 'credential');
+    var cred = mkInput('password', 'credential', 'credential (optional)');
+
+    var pool = document.createElement('select');
+    pool.setAttribute('data-field', 'pool');
+    views.forEach(function (v) {
+      var opt = document.createElement('option');
+      opt.value = v.pool;
+      opt.textContent = v.pool;
+      pool.appendChild(opt);
+    });
+
     form.appendChild(nick);
     form.appendChild(base);
     form.appendChild(cred);
+    form.appendChild(pool);
 
     var submit = document.createElement('button');
     submit.type = 'submit';
@@ -733,9 +764,11 @@
 
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
-      addMember(view.pool, { nick: nick, base: base, cred: cred });
+      addSubscription({ nick: nick, base: base, cred: cred, pool: pool });
     });
-    return form;
+
+    section.appendChild(form);
+    host.appendChild(section);
   }
 
   function loadConfig() {
@@ -806,6 +839,7 @@
 
   function renderAll(views) {
     currentViews = views || [];
+    renderAddSubscription(currentViews);
     if (!views.length) {
       renderEmpty('No pools configured.');
       return;
@@ -835,15 +869,45 @@
       .then(function (r) { return refreshAfter(r, 'Failed to ' + verb + ' member'); });
   }
 
-  function addMember(pool, fields) {
+  function addSubscription(fields) {
     var nick = (fields.nick.value || '').trim();
     var cred = fields.cred.value || '';
     var base = (fields.base.value || '').trim();
-    // Client-side validation mirrors the handler's 400 on empty inputs.
+    var pool = fields.pool.value || '';
+    // nick and a target pool are always required. The other two fields are
+    // optional — the backend resolves them for a known subscription and returns
+    // a clear 400 when it cannot.
     if (!nick) { showBanner('Add failed: nick is required'); return; }
-    if (!cred) { showBanner('Add failed: credential is required'); return; }
-    var body = { credential: cred };
+    if (!pool) { showBanner('Add failed: target pool is required'); return; }
+
+    var target = null;
+    currentViews.forEach(function (v) { if (v.pool === pool) target = v; });
+    if (!target) { showBanner('Add failed: unknown target pool "' + pool + '"'); return; }
+
+    var body = {};
+    if (cred) { body['credential'] = cred; }
     if (base) { body.base_url = base; }
+
+    // A priority target needs an explicit placement that includes this nick;
+    // there is no implicit insertion. Plain/balanced targets carry none.
+    var isPriorityTarget = !isBalanced(target) && target.priority.length > 0;
+    if (isPriorityTarget) {
+      var suggestion = target.priority.slice().concat([nick]).join(', ');
+      var placementStr = window.prompt(
+        'Pool "' + pool + '" is a priority pool. Enter the full priority order ' +
+        '(comma-separated, highest first). It must include "' + nick + '":',
+        suggestion);
+      if (placementStr == null) { return; }
+      var placement = placementStr.split(',')
+        .map(function (s) { return s.trim(); })
+        .filter(function (s) { return s.length > 0; });
+      if (placement.indexOf(nick) === -1) {
+        showBanner('Add failed: placement must include "' + nick + '"');
+        return;
+      }
+      body.placement = placement;
+    }
+
     postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick), body)
       .then(function (r) {
         // Clear inputs on success so the value never lingers in the DOM.

@@ -106,12 +106,14 @@ func enableMemberHandler(pools *auto.Pools) http.HandlerFunc {
 
 // addMemberRequest is the JSON request body for adding a pool member.
 type addMemberRequest struct {
-	Credential string `json:"credential"` // required
-	BaseURL    string `json:"base_url"`   // optional
+	Credential string   `json:"credential"` // optional; resolved from a known nick when omitted
+	BaseURL    string   `json:"base_url"`   // optional; resolved (known nick) or pool default (new nick) when omitted
+	Placement  []string `json:"placement"`  // required for a priority target with no existing slot
 }
 
 // addMemberHandler serves POST /_gateway/pool/{name}/member/{nick} —
-// adds a runtime member to a pool with a credential.
+// adds a runtime member to a pool. Credential and base_url are optional for a
+// known subscription; a priority target requires an explicit placement.
 func addMemberHandler(pools *auto.Pools) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
@@ -129,7 +131,7 @@ func addMemberHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
-		status, err := pools.AddMember(poolName, nick, req.Credential, req.BaseURL)
+		status, err := pools.AddMember(poolName, nick, req.Credential, req.BaseURL, req.Placement)
 		if err != nil {
 			w.WriteHeader(status)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

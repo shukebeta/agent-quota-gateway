@@ -349,9 +349,46 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 	return http.StatusOK, nil
 }
 
-// AddMember adds a runtime member to a pool with a credential. Returns
-// (httpStatus, error) with error containing a credential-free message.
-func (p *Pools) AddMember(poolName, nick, credential, baseURL string) (int, error) {
+// resolveAcrossPools scans every pool other than skipPool for a present
+// (non-removed) member with the given normalized nick, collecting the distinct
+// credentials and distinct *resolved* base URLs found. It is used to fill an
+// omitted credential and/or base_url when re-adding a known subscription by
+// name. Each pool lock is taken and released independently — no other lock is
+// held by the caller — mirroring MoveMember's phase separation.
+func (p *Pools) resolveAcrossPools(skipPool, nick string) (creds, baseURLs []string) {
+	credSeen := make(map[string]bool)
+	urlSeen := make(map[string]bool)
+	for name, c := range p.byPool {
+		if name == skipPool {
+			continue
+		}
+		c.mu.Lock()
+		present := (c.indexOf(nick) >= 0 || c.isAddedMemberLocked(nick)) && !c.isRemovedLocked(nick)
+		if present {
+			if b, ok := c.backendByNickLocked(nick); ok {
+				if b.Credential != "" && !credSeen[b.Credential] {
+					credSeen[b.Credential] = true
+					creds = append(creds, b.Credential)
+				}
+				if b.BaseURL != "" && !urlSeen[b.BaseURL] {
+					urlSeen[b.BaseURL] = true
+					baseURLs = append(baseURLs, b.BaseURL)
+				}
+			}
+		}
+		c.mu.Unlock()
+	}
+	return creds, baseURLs
+}
+
+// AddMember adds a runtime member to a pool. Credential and baseURL are optional
+// for a *known* subscription: when omitted, they are resolved by scanning the
+// other pools for the same nick (credential and base_url resolve independently).
+// A priority target requires an explicit placement (must include nick), reusing
+// the move path's validation; plain/balanced targets must carry none. The
+// resolved concrete base_url is persisted — never an empty string when one is
+// resolvable. Returns (httpStatus, error) with a credential-free message.
+func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement []string) (int, error) {
 	c, ok := p.byPool[poolName]
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
@@ -360,23 +397,41 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string) (int, erro
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
 	}
-	if credential == "" {
-		return http.StatusBadRequest, fmt.Errorf("credential is required")
-	}
-	// Validate baseURL if provided.
+	// Validate baseURL if explicitly provided.
 	if baseURL != "" {
 		if _, err := backend.ValidateBaseURL(baseURL); err != nil {
 			return http.StatusBadRequest, fmt.Errorf("invalid base_url: %w", err)
 		}
 	}
 
+	// Phase 1: resolve omitted credential/base_url from other pools (no target
+	// lock held). Credential and base_url are resolved independently.
+	resolvedCred := credential
+	resolvedURL := baseURL
+	if credential == "" || baseURL == "" {
+		creds, baseURLs := p.resolveAcrossPools(poolName, normalized)
+		if credential == "" {
+			switch len(creds) {
+			case 1:
+				resolvedCred = creds[0]
+			case 0:
+				return http.StatusBadRequest, fmt.Errorf("credential is required: nick %s is not a known subscription in any other pool", normalized)
+			default:
+				return http.StatusBadRequest, fmt.Errorf("credential for nick %s is ambiguous across pools; specify it explicitly", normalized)
+			}
+		}
+		if baseURL == "" && len(baseURLs) > 1 {
+			return http.StatusBadRequest, fmt.Errorf("base_url for nick %s is ambiguous across pools; specify it explicitly", normalized)
+		}
+		if baseURL == "" && len(baseURLs) == 1 {
+			resolvedURL = baseURLs[0]
+		}
+		// len(baseURLs)==0 leaves resolvedURL empty → pool default below.
+	}
+
+	// Phase 2: validate + commit on the target pool under its lock.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// Validate baseURL is provided when pool has no static members to fall back to.
-	if baseURL == "" && len(c.nicks) == 0 {
-		return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no static members")
-	}
 
 	// Check for duplicate: already exists as static or runtime-added.
 	if c.indexOf(normalized) >= 0 {
@@ -386,13 +441,40 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string) (int, erro
 		return http.StatusConflict, fmt.Errorf("nick %s already exists as a runtime-added member", normalized)
 	}
 
+	// Resolve base_url to a concrete value: an unresolved (new-nick) base_url
+	// falls back to the pool default so the persisted record is self-describing.
+	if resolvedURL == "" {
+		if len(c.nicks) == 0 {
+			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no static members")
+		}
+		resolvedURL = c.backendAt(0).BaseURL
+	}
+
+	// Placement: a priority target needs an explicit order including nick; a
+	// plain/balanced target must not carry one. Same rules as the move path.
+	isPriorityTarget := c.balanceGap == 0 && len(c.effectivePriorityLocked()) > 0
+	var normPlacement []string
+	if isPriorityTarget {
+		var status int
+		var err error
+		normPlacement, status, err = c.validatePlacementLocked(normalized, placement)
+		if err != nil {
+			return status, err
+		}
+	} else if len(placement) > 0 {
+		return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
+	}
+
 	// If previously removed, clear the removed flag so it becomes selectable again.
 	delete(c.removedMembers, normalized)
 
-	// Store the added member.
+	// Store the added member with the resolved concrete credential and base_url.
 	c.addedMembers[normalized] = AddedMember{
-		Credential: credential,
-		BaseURL:    baseURL,
+		Credential: resolvedCred,
+		BaseURL:    resolvedURL,
+	}
+	if isPriorityTarget {
+		c.setPriorityOverrideEffectiveLocked(normPlacement)
 	}
 	c.notifyMutate()
 	fmt.Fprintf(c.logOut, "auto[%s]: added runtime member %s\n", c.pool, normalized)
