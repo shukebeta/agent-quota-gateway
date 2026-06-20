@@ -170,11 +170,11 @@ func TestMove_overwriteConflict(t *testing.T) {
 		backend.EnvPrefix + "DST_BACKEND_D": "cred-d",
 	})
 	// Source carries an added member a (explicit base).
-	if status, err := p.AddMember("src", "a", "k1", "https://u1.example"); status != http.StatusOK || err != nil {
+	if status, err := p.AddMember("src", "a", "k1", "https://u1.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember src a: status=%d err=%v", status, err)
 	}
 	// Target already has a different a.
-	if status, err := p.AddMember("dst", "a", "k2", "https://u2.example"); status != http.StatusOK || err != nil {
+	if status, err := p.AddMember("dst", "a", "k2", "https://u2.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember dst a: status=%d err=%v", status, err)
 	}
 
@@ -207,10 +207,10 @@ func TestMove_overwriteMatchSilent(t *testing.T) {
 		backend.EnvPrefix + "SRC_BACKEND_S": "cred-s",
 		backend.EnvPrefix + "DST_BACKEND_D": "cred-d",
 	})
-	if status, err := p.AddMember("src", "a", "k1", "https://u1.example"); status != http.StatusOK || err != nil {
+	if status, err := p.AddMember("src", "a", "k1", "https://u1.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember src a: status=%d err=%v", status, err)
 	}
-	if status, err := p.AddMember("dst", "a", "k1", "https://u1.example"); status != http.StatusOK || err != nil {
+	if status, err := p.AddMember("dst", "a", "k1", "https://u1.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember dst a: status=%d err=%v", status, err)
 	}
 
