@@ -264,11 +264,17 @@ type PoolRuntimeConfig struct {
 	// The state file may contain credentials after this change, so it must be
 	// protected at 0600 (see persist package).
 	AddedMembers map[string]AddedMember `json:"added_members,omitempty"`
+	// RemovedMembers is the list of member nicks that have been operator-removed.
+	// Persisting these tombstones makes removal permanent and uniform: a removed
+	// static member stays removed across restart instead of resurfacing, matching
+	// the always-permanent behaviour of a removed runtime-added member. Each nick
+	// appears at most once. Empty means no members are removed.
+	RemovedMembers []string `json:"removed_members,omitempty"`
 }
 
 // AddedMember is a runtime-added pool member with credential.
 type AddedMember struct {
-	Credential string `json:"credential"`           // stored, never returned in config views
+	Credential string `json:"credential"`         // stored, never returned in config views
 	BaseURL    string `json:"base_url,omitempty"` // optional; pool default when empty
 }
 
@@ -478,20 +484,10 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 			copy(view.Priority, pri)
 		}
 
-		// Members.
-		// Include both static and runtime-added members.
-		// Static members always appear (even if removed), runtime-added
-		// members disappear when removed.
-		allMembers := make([]string, 0, len(c.nicks)+len(c.addedMembers))
-		for _, nick := range c.nicks {
-			allMembers = append(allMembers, nick)
-		}
-		for nick := range c.addedMembers {
-			if !c.removedMembers[nick] {
-				allMembers = append(allMembers, nick)
-			}
-		}
-		sort.Strings(allMembers)
+		// Members: the effective set (static + runtime-added − removed), sorted.
+		// Removal is permanent deletion, so removed members are omitted entirely
+		// — consistent with poolStatus and the selection path.
+		allMembers := c.addedMembersLocked()
 
 		view.Members = make([]PoolMemberConfigView, 0, len(allMembers))
 		curNick := c.curAddedNick
@@ -517,13 +513,10 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 			} else {
 				member.BaseURL = c.backendAt(c.indexOf(nick)).BaseURL
 			}
-			// Determine status.
-			if c.disabled[nick] || c.removedMembers[nick] {
+			// Determine status. Removed members are already excluded from
+			// allMembers above, so only the disabled flag maps to "disabled".
+			if c.disabled[nick] {
 				member.Status = "disabled"
-				// Mark removed members as disabled too
-				if c.removedMembers[nick] {
-					member.Disabled = true
-				}
 			} else if nick == curNick {
 				member.Status = "active"
 			} else if _, ok := c.exhaustedUntilLocked(nick); ok {
@@ -952,9 +945,16 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 	defer c.mu.Unlock()
 	c.clearExpiredLocked()
 
-	curNick := c.nicks[c.cur]
-	members := make([]MemberStatus, 0, len(c.nicks))
-	for _, nick := range c.nicks {
+	// Build from the effective member set (static + runtime-added − removed),
+	// matching EffectiveConfig and the selection path, so removed members never
+	// surface here and runtime-added members are represented.
+	curNick := c.curAddedNick
+	if curNick == "" && len(c.nicks) > 0 {
+		curNick = c.nicks[c.cur]
+	}
+	effective := c.addedMembersLocked()
+	members := make([]MemberStatus, 0, len(effective))
+	for _, nick := range effective {
 		ms := MemberStatus{Nick: nick}
 		if c.disabled[nick] {
 			ms.Status = "disabled"
@@ -967,8 +967,8 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 		} else {
 			ms.Status = "idle"
 		}
-		if idx := c.indexOf(nick); idx >= 0 {
-			snap := store.Get(c.backendAt(idx).QuotaKey())
+		if b, ok := c.backendByNickLocked(nick); ok {
+			snap := store.Get(b.QuotaKey())
 			if snap.HasData() {
 				snapCopy := snap
 				ms.Snapshot = &snapCopy
@@ -1124,10 +1124,18 @@ func (c *Controller) runtimeConfig() PoolRuntimeConfig {
 		}
 	}
 
+	// Snapshot the removed-member tombstones (sorted) so removal survives restart.
+	removed := make([]string, 0, len(c.removedMembers))
+	for nick := range c.removedMembers {
+		removed = append(removed, nick)
+	}
+	sort.Strings(removed)
+
 	return PoolRuntimeConfig{
 		PriorityOverride: priOverride,
 		Disabled:         disabled,
 		AddedMembers:     addedMembers,
+		RemovedMembers:   removed,
 	}
 }
 
@@ -1183,9 +1191,47 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 			BaseURL:    am.BaseURL,
 		}
 	}
-	// Note: removedMembers is intentionally not persisted.
-	// A removed static member is re-selected on restart unless removed again.
-	// A removed added member is simply absent from addedMembers on reload.
+	// Restore removed-member tombstones. These make removal permanent across
+	// restart for static members too (a removed runtime-added member is already
+	// absent from addedMembers above). Tombstones for nicks that are neither
+	// static nor added are harmless and kept as-is.
+	c.removedMembers = make(map[string]bool)
+	for _, nick := range cfg.RemovedMembers {
+		c.removedMembers[nick] = true
+	}
+
+	// loadState restored the sticky pointer before this runs, so the current
+	// member may now be removed (or otherwise unavailable). Re-anchor before
+	// serving traffic so Current() / pool.active never point at a removed member.
+	c.reanchorLocked()
+}
+
+// reanchorLocked moves the active pointer off a current member that is now
+// unavailable (removed, disabled, or exhausted), switching to the first healthy
+// member when one exists and otherwise to the soonest-resetting non-removed
+// member. It is a no-op when the current member is healthy. Used at startup
+// after runtime config (including removed-member tombstones) is restored on top
+// of the persisted sticky pointer. Caller holds c.mu.
+func (c *Controller) reanchorLocked() {
+	if len(c.nicks) == 0 && len(c.addedMembers) == 0 {
+		return
+	}
+	curNick := c.curAddedNick
+	if curNick == "" && len(c.nicks) > 0 {
+		curNick = c.nicks[c.cur]
+	}
+	if curNick != "" && !c.isUnavailableLocked(curNick) {
+		return
+	}
+	if nick, ok := c.firstHealthyNickLocked(); ok {
+		c.setActiveMemberLocked(nick)
+		return
+	}
+	// Whole pool is unavailable: anchor on the soonest non-removed member so the
+	// active pointer is never a removed one.
+	if nick, _ := c.soonestNickLocked(); nick != "" {
+		c.setActiveMemberLocked(nick)
+	}
 }
 
 // ModifyResponse is the per-pool failover hook. It acts on two classes of
@@ -1576,7 +1622,7 @@ func (c *Controller) soonestLocked() (int, time.Time) {
 	bestIdx, bestSet := c.cur, false
 	var bestReset time.Time
 	for idx, nick := range c.nicks {
-		if c.disabled[nick] {
+		if c.disabled[nick] || c.removedMembers[nick] {
 			continue
 		}
 		reset, ok := c.exhaustedUntilLocked(nick)
