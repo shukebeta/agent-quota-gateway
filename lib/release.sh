@@ -215,7 +215,7 @@ release_generate_changelog() {
 
     {
         printf '# Changelog\n\n'
-        printf '_Generated from beta tags with `bash bin/generate-changelog`._\n\n'
+        printf '_Generated from beta tags with `bash scripts/generate-changelog`._\n\n'
 
         if (( ${#tags[@]} == 0 )); then
             printf 'No beta tags yet.\n'
