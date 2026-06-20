@@ -245,14 +245,13 @@ func TestAddRemoveEndpoints(t *testing.T) {
 		}
 	}
 
-	// Remove a static member (hide it from selection).
+	// Remove a static member: removal is permanent deletion, so it disappears
+	// from the config roster entirely (not merely flagged disabled).
 	delete(t, srv.URL+"/_gateway/pool/auto/member/a", http.StatusOK)
 	view = fetchPool(t, srv.URL, "auto")
 	for _, m := range view.Members {
-		if m.Nick == "a" && !m.Disabled {
-			// Note: static members that are "removed" via this endpoint stay
-			// in the config but are hidden from selection. The current behavior
-			// is that they disappear from the effective member list.
+		if m.Nick == "a" {
+			t.Error("removed static member a still appears in config view")
 		}
 	}
 

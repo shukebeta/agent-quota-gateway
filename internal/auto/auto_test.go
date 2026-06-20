@@ -3,6 +3,7 @@ package auto
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -1590,5 +1591,95 @@ func TestRuntimeConfig_concurrentMutation(t *testing.T) {
 	cur := c.Current()
 	if cur != "a" && cur != "b" && cur != "c" {
 		t.Errorf("Current()=%q, not a valid nick", cur)
+	}
+}
+
+// TestRuntimeConfig_removedMemberRoundTripAndReanchor proves that a removed
+// member survives a persist/load cycle (issue #85): the tombstone is
+// serialized, restored on a fresh controller, and the active pointer is
+// re-anchored off the removed member at load — never left pointing at it.
+func TestRuntimeConfig_removedMemberRoundTripAndReanchor(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	// Start anchored on "a" (index 0), then remove "a".
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+	c.mu.Lock()
+	c.removedMembers["a"] = true
+	c.mu.Unlock()
+
+	cfg := c.runtimeConfig()
+	if len(cfg.RemovedMembers) != 1 || cfg.RemovedMembers[0] != "a" {
+		t.Fatalf("RemovedMembers=%v, want [a]", cfg.RemovedMembers)
+	}
+
+	// The tombstone must land in the serialized JSON (the persisted state file).
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal cfg: %v", err)
+	}
+	if !strings.Contains(string(raw), `"removed_members"`) {
+		t.Errorf("serialized config missing removed_members: %s", raw)
+	}
+
+	// Reload into a fresh controller that also starts anchored on the removed
+	// member "a" (worst case: loadState restored sticky=a before runtime config).
+	c2 := newController(t, 0, clock, io.Discard, "a", "b", "c")
+	c2.loadRuntimeConfig(cfg)
+
+	// a stays removed across restart.
+	c2.mu.Lock()
+	stillRemoved := c2.isRemovedLocked("a")
+	c2.mu.Unlock()
+	if !stillRemoved {
+		t.Error("removed member a not restored after reload")
+	}
+
+	// Active pointer must have been re-anchored off the removed member.
+	if got := c2.Current(); got == "a" {
+		t.Errorf("after reload Current()=%q, want a non-removed member", got)
+	}
+
+	// a must be absent from both user-facing rosters.
+	ps := c2.poolStatus(quota.NewStore())
+	if ps.Active == "a" {
+		t.Errorf("poolStatus Active=%q, want non-removed", ps.Active)
+	}
+	for _, m := range ps.Members {
+		if m.Nick == "a" {
+			t.Errorf("poolStatus still lists removed member a: %+v", ps.Members)
+		}
+	}
+}
+
+// TestRecord429_soonestFallbackExcludesRemoved proves the all-unavailable
+// fallback never surfaces a removed member as the representative, even when
+// that member is also exhausted with the soonest reset (issue #85).
+func TestRecord429_soonestFallbackExcludesRemoved(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+
+	// a 429s with the SOONER reset, then is removed: it stays in the exhausted
+	// map but must not be eligible as the soonest representative.
+	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, 60*time.Second)); err != nil {
+		t.Fatalf("ModifyResponse a: %v", err)
+	}
+	c.mu.Lock()
+	c.removedMembers["a"] = true
+	c.mu.Unlock()
+
+	// b 429s with a LATER reset; pool is now dry (a removed, b exhausted).
+	resp := resp429(c.resolve(t, "b"), clock, 300*time.Second)
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse b: %v", err)
+	}
+
+	if got := c.Current(); got != "b" {
+		t.Errorf("all-unavailable representative=%q, want b (removed a must be excluded)", got)
+	}
+	rb, _, exhausted := c.ResolveAuto()
+	if !exhausted {
+		t.Error("ResolveAuto exhausted=false, want true while pool dry")
+	}
+	if rb.Nick != "b" {
+		t.Errorf("ResolveAuto nick=%q, want b (removed a must never be surfaced)", rb.Nick)
 	}
 }

@@ -283,7 +283,7 @@ Declaring both is a startup error.
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
-| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all state is in-memory only and lost on restart. The file stores sticky pointers, exhausted maps, quota snapshots, and runtime-added members (including their credentials). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all state is in-memory only and lost on restart. The file stores sticky pointers, exhausted maps, quota snapshots, runtime-added members (including their credentials), and removed-member tombstones (so a removal stays in effect across restart). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
@@ -618,6 +618,15 @@ removes a member — static or runtime-added — from selection and returns `200
 `404` on an unknown pool and `400` on a missing nick or a nick not present in
 the pool. If the removed member was the active one, the pool force-switches to
 the next healthy member. All error bodies are credential-free.
+
+Removal is **permanent and survives restart**: the tombstone is persisted to
+the state file, so a removed static member stays removed across a restart
+instead of resurfacing. A removed member — static or runtime-added — is omitted
+entirely from both `/_gateway/config` and `/_gateway/pool`, not merely flagged
+disabled, and is never selected for routing. A removed *runtime-added* member
+can be re-added with `POST .../member/{nick}` (which clears its tombstone); a
+removed *static* member stays out until its tombstone is cleared from the state
+file, since re-adding a still-declared static nick returns `409`.
 
 > **Shared mode:** these are **write** endpoints. In shared mode (see below)
 > any tailnet member that can reach the port can reorder priority, disable or
