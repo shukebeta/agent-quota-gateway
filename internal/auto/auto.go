@@ -404,7 +404,11 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 }
 
 // SetMemberDisabled sets or clears the disabled flag for a member in a pool.
-// Returns (httpStatus, error) with error containing a credential-free message.
+// The target nick must be a present (non-removed) member — static or
+// runtime-added — mirroring RemoveMember's semantics. Re-enabling a member that
+// was operator-removed is rejected, matching the rest of the runtime-member
+// surface. Returns (httpStatus, error) with error containing a
+// credential-free message.
 func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) {
 	c, ok := p.controller(poolName)
 	if !ok {
@@ -414,11 +418,13 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
 	}
-	if c.indexOf(normalized) < 0 {
-		return http.StatusBadRequest, fmt.Errorf("unknown nick: %s", normalized)
-	}
 
 	c.mu.Lock()
+	present := (c.indexOf(normalized) >= 0 || c.isAddedMemberLocked(normalized)) && !c.isRemovedLocked(normalized)
+	if !present {
+		c.mu.Unlock()
+		return http.StatusBadRequest, fmt.Errorf("unknown nick: %s", normalized)
+	}
 	c.setDisabledLocked(normalized, off)
 	c.mu.Unlock()
 	return http.StatusOK, nil
@@ -1832,10 +1838,13 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 		c.priorityOverride = nil
 	}
 
-	// Restore disabled set.
+	// Restore disabled set. A disabled nick on a runtime-added member must
+	// survive restart, so accept either static or runtime-added sources; the
+	// presence of the member (addedMembers has already been restored above)
+	// is the only requirement.
 	c.disabled = make(map[string]bool)
 	for _, nick := range cfg.Disabled {
-		if c.indexOf(nick) >= 0 {
+		if c.indexOf(nick) >= 0 || c.isAddedMemberLocked(nick) {
 			c.disabled[nick] = true
 		} else {
 			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from disabled list\n", c.pool, nick)
