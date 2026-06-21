@@ -2162,14 +2162,18 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 		{snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset},
 		{snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset},
 	} {
-		// windowBlocks enforces the reset-freshness guard for the no-status
-		// branch; the explicit check below documents this function's
-		// invariant — a window only contributes when its own reset is still
-		// in the future. The two checks agree (#125).
+		// windowBlocks is the single source of truth for the freshness
+		// contract: the no-status branch requires reset != nil AND
+		// now.Before(*reset), so a frozen at-cap snapshot whose reset has
+		// already passed reads as not blocking here. The status branch
+		// returns true regardless of reset (an explicit "rejected" is
+		// authoritative and refreshed on every response), so w.reset may
+		// still be nil past the gate — skip those windows since we have no
+		// future reset to anchor.
 		if !windowBlocks(w.util, w.status, w.reset, now) {
 			continue
 		}
-		if w.reset == nil || !now.Before(*w.reset) {
+		if w.reset == nil {
 			continue
 		}
 		if !ok || w.reset.After(reset) {

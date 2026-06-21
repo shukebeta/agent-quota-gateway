@@ -373,6 +373,31 @@ func TestSnapRejects_7dStaleAtCapMirrors5h(t *testing.T) {
 	}
 }
 
+// TestStoreExhaustedUntil_rejectedStatusWithNilResetSkipsWindow locks in
+// the edge-case behaviour carried over from the pre-#125 implementation:
+// when a window reports status="rejected" but carries no captured reset,
+// there is no future reset to anchor, so the window contributes nothing.
+// The fresh-redundant reset (the explicit `w.reset == nil` skip past the
+// windowBlocks gate in storeExhaustedUntilLocked) preserves this.
+func TestStoreExhaustedUntil_rejectedStatusWithNilResetSkipsWindow(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	util := 0.4
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		// Unified5hReset deliberately nil — the captured 429 carried no
+		// reset header, so there is no future anchor.
+		AsOf: clock.now(),
+	})
+
+	if got, ok := c.exhaustedUntil("a"); ok {
+		t.Errorf("exhaustedUntil = %v,true, want false (no captured reset → no contribution)", got)
+	}
+}
+
 // TestStoreExhaustion_runtimePriorityPreemptsBack proves that a pool with
 // no static PRIORITY declaration, given a runtime priority via SetPriority,
 // correctly preempts back to a recovered higher-priority member. This is the
