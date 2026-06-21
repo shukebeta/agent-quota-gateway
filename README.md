@@ -502,7 +502,7 @@ curl http://127.0.0.1:8080/_gateway/quota?backend=auto
 
 ```json
 {
-  "backend": "auto/b",
+  "backend": "b",
   "active_backend": "b",
   "unified_status": "allowed",
   "unified_5h_utilization": 0.05,
@@ -510,7 +510,8 @@ curl http://127.0.0.1:8080/_gateway/quota?backend=auto
 }
 ```
 
-`backend` is the pool-qualified quota key (`<pool>/<member>`);
+`backend` is the quota store key — the member nick — under which the
+shared `quota.Store` files the most recent snapshot for this member;
 `active_backend` is the member nick. Because `active_backend` changes
 alongside the snapshot, a sudden utilization jump (e.g. 99% → 5%) on a
 switch is self-explained: the gateway moved to a fresher account. An
