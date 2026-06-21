@@ -698,15 +698,15 @@
     if (kind === '5h') {
       var h5 = Math.floor(totalMin / 60);
       var m5 = totalMin % 60;
-      return h5 > 0 ? 'in ' + h5 + 'hr ' + m5 + ' min' : 'in ' + m5 + ' min';
+      return h5 > 0 ? 'in ' + h5 + 'hr ' + m5 + 'min' : 'in ' + m5 + 'min';
     }
     // 7d window.
     var days = Math.floor(totalMin / 1440);
     var hrs = Math.floor((totalMin % 1440) / 60);
     var mins = totalMin % 60;
     return days > 0
-      ? 'in ' + days + 'd ' + hrs + ' hr ' + mins + ' min'
-      : 'in ' + hrs + ' hr ' + mins + ' min';
+      ? 'in ' + days + 'd ' + hrs + 'hr ' + mins + 'min'
+      : 'in ' + hrs + 'hr ' + mins + 'min';
   }
 
   function mkInput(type, field, placeholder) {
