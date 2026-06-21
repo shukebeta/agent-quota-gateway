@@ -580,8 +580,8 @@ the wrong tool.
 | `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
 | `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "base_url": "...", "mode": "plain"}` (`name` and `base_url` required, `mode` optional and defaults to `plain`). Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
-| `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member out of selection and failover |
-| `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member to rotation |
+| `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
+| `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
 | `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "..."}` (`credential` required, `base_url` optional). Persisted with its credential. |
 | `POST /_gateway/pool/{name}/member/{nick}/move` | Move a subscription to another pool; body `{"to": "<pool>", "placement": [...], "force": false}`. |
 | `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |

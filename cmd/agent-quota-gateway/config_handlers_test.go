@@ -150,6 +150,71 @@ func TestDisableEnableEndpoints(t *testing.T) {
 	post(t, srv.URL+"/_gateway/pool/auto/member/ghost/disable", http.StatusBadRequest)
 }
 
+// TestDisableEnableEndpoints_runtimeAdded proves that the disable/enable
+// endpoints accept a runtime-added member (the regression in #114 — the
+// membership gate previously validated only the static roster), and that the
+// disabled flag survives a restart via the runtime-config persist path.
+func TestDisableEnableEndpoints_runtimeAdded(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	pools := loadPools(t)
+	srv := configMux(t, pools)
+
+	// Add a runtime member.
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/c",
+		`{"credential":"sk-ant-c"}`, http.StatusOK)
+
+	// Disable the runtime-added member: must succeed.
+	post(t, srv.URL+"/_gateway/pool/auto/member/c/disable", http.StatusOK)
+	if !memberDisabled(t, srv.URL, "auto", "c") {
+		t.Error("runtime-added member c should be disabled after the disable call")
+	}
+	if got := memberStatus(t, srv.URL, "auto", "c"); got != "disabled" {
+		t.Errorf("runtime-added member c status=%q, want disabled", got)
+	}
+
+	// Re-enable the runtime-added member: must succeed.
+	post(t, srv.URL+"/_gateway/pool/auto/member/c/enable", http.StatusOK)
+	if memberDisabled(t, srv.URL, "auto", "c") {
+		t.Error("runtime-added member c should be enabled after the enable call")
+	}
+
+	// Unknown runtime nick still 400.
+	post(t, srv.URL+"/_gateway/pool/auto/member/ghost/disable", http.StatusBadRequest)
+
+	// Removing the runtime member and then attempting to disable it must
+	// still 400 — the gate is on present (non-removed), not merely known.
+	delete(t, srv.URL+"/_gateway/pool/auto/member/c", http.StatusOK)
+	post(t, srv.URL+"/_gateway/pool/auto/member/c/disable", http.StatusBadRequest)
+
+	// The disabled flag on a runtime-added member must survive restart.
+	// Re-add c, disable, snapshot the runtime config, reload into a fresh
+	// Pools, and verify the flag is still set on the restored member.
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/c",
+		`{"credential":"sk-ant-c"}`, http.StatusOK)
+	post(t, srv.URL+"/_gateway/pool/auto/member/c/disable", http.StatusOK)
+	cfg := pools.PersistRuntimeConfig()
+	pools2 := loadPools(t)
+	pools2.LoadRuntimeConfig(cfg)
+	srv2 := configMux(t, pools2)
+	if !memberDisabled(t, srv2.URL, "auto", "c") {
+		t.Error("runtime-added member c disabled flag did not survive restart")
+	}
+}
+
+// memberStatus returns the status string for one member in a pool's
+// effective config view.
+func memberStatus(t *testing.T, baseURL, pool, nick string) string {
+	t.Helper()
+	for _, m := range fetchPool(t, baseURL, pool).Members {
+		if m.Nick == nick {
+			return m.Status
+		}
+	}
+	t.Fatalf("member %q not found in pool %q", nick, pool)
+	return ""
+}
+
 // TestPriorityEndpoint drives the priority endpoint: a valid reorder is applied
 // (and expanded to a total order), an unknown nick is rejected 400, and a
 // balanced pool is rejected 409.
