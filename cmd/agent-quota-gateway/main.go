@@ -32,6 +32,25 @@ import (
 // context. In normal operation the resolver middleware guarantees one.
 const defaultBackendKey = "default"
 
+// hasQuotaWindow reports whether snap carries at least one quota-window
+// field: 5h/7d status / utilization / reset, the legacy unified-status
+// fields, or overage metadata. It deliberately excludes OrgID — that
+// field is metadata only, and a Put on an org-id-only response would
+// wipe the previously-cached 5h/7d resets to nil, causing the UI to
+// flash the reset cells to "-" until the next quota-bearing response
+// (issue #121). Distinct from Snapshot.HasData, whose contract is
+// "any upstream-derived signal" and whose other callers (poolStatus,
+// the test helper) want the broader form.
+func hasQuotaWindow(s quota.Snapshot) bool {
+	return s.UnifiedStatus != "" ||
+		s.UnifiedReset != nil ||
+		s.UnifiedRepresentativeClaim != "" ||
+		s.Unified5hStatus != "" || s.Unified5hUtilization != nil || s.Unified5hReset != nil ||
+		s.Unified7dStatus != "" || s.Unified7dUtilization != nil || s.Unified7dReset != nil ||
+		s.UnifiedFallbackPercentage != nil ||
+		s.UnifiedOverageStatus != "" || s.UnifiedOverageDisabledReason != ""
+}
+
 // version is stamped at build time via -ldflags "-X main.version=...".
 // It defaults to "dev" for a plain `go build`. The deploy script sets it
 // from `git describe` so an upgraded service is verifiable with -version.
@@ -143,14 +162,21 @@ func run(configFlag string) error {
 	// middleware selected for the request. Header-only inspection — no
 	// body access.
 	//
-	// We only store snapshots that actually carry quota data. An
-	// upstream response with no rate-limit headers (e.g. a 5xx page,
+	// We only Put snapshots that carry at least one quota-window field.
+	// An upstream response with no rate-limit headers (e.g. a 5xx page,
 	// or a future endpoint that doesn't return them) would otherwise
 	// overwrite the last known-good snapshot with an empty one, which
-	// would look to consumers like the quota state was reset.
+	// would look to consumers like the quota state was reset. The same
+	// shape fires for org-id-only responses (e.g. GET /v1/models carries
+	// anthropic-organization-id but no rate-limit headers): a Put on such
+	// a snapshot wipes the previously-cached 5h/7d resets to nil, and
+	// the UI flashes the reset cells to "-" until the next quota-bearing
+	// response lands (issue #121). hasQuotaWindow excludes OrgID — that
+	// field is metadata and does not invalidate the last known quota
+	// state.
 	observer := func(resp *http.Response) {
 		snap := quota.Extract(resp)
-		if !snap.HasData() {
+		if !hasQuotaWindow(snap) {
 			return
 		}
 		key := defaultBackendKey
