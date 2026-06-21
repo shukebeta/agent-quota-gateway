@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1007,4 +1008,133 @@ func keysOf(m map[string]quota.Snapshot) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// runObserver is a test-local mirror of the run() observer closure: it
+// extracts the snapshot from resp and Puts it under the resolved backend's
+// quota key iff hasQuotaWindow reports true. Mirrors the production change
+// in #121. The test-file mkObserver helper above keeps its HasData()
+// semantics per the issue's explicit non-goal.
+func runObserver(store *quota.Store) proxy.ResponseObserver {
+	return func(resp *http.Response) {
+		snap := quota.Extract(resp)
+		if !hasQuotaWindow(snap) {
+			return
+		}
+		key := defaultBackendKey
+		if resp.Request != nil {
+			if b, ok := backend.FromContext(resp.Request.Context()); ok {
+				key = b.QuotaKey()
+			}
+		}
+		store.Put(key, snap)
+	}
+}
+
+// mkRespWithHeaders builds a minimal *http.Response carrying only the given
+// headers — used by the observer tests below to drive the observer closure
+// without spinning up a test server.
+func mkRespWithHeaders(headers map[string]string) *http.Response {
+	h := make(http.Header, len(headers))
+	for k, v := range headers {
+		h.Set(k, v)
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     h,
+		Request:    &http.Request{},
+	}
+}
+
+// TestObserver_orgIDOnlyResponseDoesNotErasePriorSnapshot is the core
+// #121 regression: a response that carries only anthropic-organization-id
+// (e.g. GET /v1/models) must NOT trigger store.Put — the prior snapshot's
+// 5h/7d resets must survive, so the UI does not flash the reset cells to
+// "-" until the next quota-bearing response.
+func TestObserver_orgIDOnlyResponseDoesNotErasePriorSnapshot(t *testing.T) {
+	store := quota.NewStore()
+	observer := runObserver(store)
+
+	// Seed the store with a snapshot that has live 5h/7d reset fields.
+	reset5h := time.Unix(1_700_000_000+3600, 0).UTC()
+	reset7d := time.Unix(1_700_000_000+7*24*3600, 0).UTC()
+	util := 0.42
+	store.Put("b", quota.Snapshot{
+		Unified5hReset:       &reset5h,
+		Unified7dReset:       &reset7d,
+		Unified5hUtilization: &util,
+		AsOf:                 time.Unix(1_700_000_000, 0).UTC(),
+	})
+
+	// Run the observer against an org-id-only response.
+	observer(mkRespWithHeaders(map[string]string{
+		"anthropic-organization-id": "org_test123",
+	}))
+
+	got := store.Get("b")
+	if got.Unified5hReset == nil || !got.Unified5hReset.Equal(reset5h) {
+		t.Errorf("after org-id-only response, store.Unified5hReset = %v, want %v (prior snapshot must survive)", got.Unified5hReset, reset5h)
+	}
+	if got.Unified7dReset == nil || !got.Unified7dReset.Equal(reset7d) {
+		t.Errorf("after org-id-only response, store.Unified7dReset = %v, want %v (prior snapshot must survive)", got.Unified7dReset, reset7d)
+	}
+	if got.Unified5hUtilization == nil || *got.Unified5hUtilization != util {
+		t.Errorf("after org-id-only response, store.Unified5hUtilization = %v, want %v", got.Unified5hUtilization, util)
+	}
+}
+
+// TestObserver_5hResponseUpdatesSnapshot proves the gate does not over-fire:
+// a response that carries the 5h reset must still update the snapshot.
+// (Without a backend on the request context, the observer files under
+// defaultBackendKey; that's fine — the test only needs to prove the
+// observer Put the snapshot at all.)
+func TestObserver_5hResponseUpdatesSnapshot(t *testing.T) {
+	store := quota.NewStore()
+	observer := runObserver(store)
+
+	reset := time.Unix(1_700_000_123, 0).UTC()
+	observer(mkRespWithHeaders(map[string]string{
+		"anthropic-ratelimit-unified-5h-reset": strconv.FormatInt(reset.Unix(), 10),
+	}))
+
+	got := store.Get(defaultBackendKey)
+	if got.Unified5hReset == nil || !got.Unified5hReset.Equal(reset) {
+		t.Errorf("store.Unified5hReset = %v, want %v (5h reset must be filed)", got.Unified5hReset, reset)
+	}
+}
+
+// TestObserver_legacyUnifiedStatusOnlyResponseUpdatesSnapshot covers the
+// legacy shape: a response with only anthropic-ratelimit-unified-status
+// (no 5h/7d split) must still update the snapshot. Anthropic's older
+// responses sometimes carry just this header.
+func TestObserver_legacyUnifiedStatusOnlyResponseUpdatesSnapshot(t *testing.T) {
+	store := quota.NewStore()
+	observer := runObserver(store)
+
+	observer(mkRespWithHeaders(map[string]string{
+		"anthropic-ratelimit-unified-status": "allowed",
+	}))
+
+	got := store.Get(defaultBackendKey)
+	if got.UnifiedStatus != "allowed" {
+		t.Errorf("store.UnifiedStatus = %q, want %q", got.UnifiedStatus, "allowed")
+	}
+}
+
+// TestObserver_overageStatusOnlyResponseUpdatesSnapshot covers the overage
+// metadata path: a response with only anthropic-ratelimit-unified-overage-status
+// must update the snapshot. Overage signals matter for capacity decisions even
+// when 5h/7d windows are absent.
+func TestObserver_overageStatusOnlyResponseUpdatesSnapshot(t *testing.T) {
+	store := quota.NewStore()
+	observer := runObserver(store)
+
+	observer(mkRespWithHeaders(map[string]string{
+		"anthropic-ratelimit-unified-overage-status": "active",
+	}))
+
+	got := store.Get(defaultBackendKey)
+	if got.UnifiedOverageStatus != "active" {
+		t.Errorf("store.UnifiedOverageStatus = %q, want %q", got.UnifiedOverageStatus, "active")
+	}
 }
