@@ -199,6 +199,44 @@ func (p *Poller) pollOne(ctx context.Context, prov provider, b backend.Backend) 
 	return prov.parse(body, p.now())
 }
 
+// Name returns the provider's registry label (e.g. "z.ai/zhipu"). It is
+// the stable identifier the rest of the codebase uses to switch on
+// provider-specific behaviour (see issue #138: the long-window column
+// is monthly for z.ai/zhipu, weekly for everything else).
+func (p provider) Name() string { return p.name }
+
+// WindowLabels describes how the UI should label the two rolling-window
+// columns in the pool table. The short window is always the 5h-equivalent
+// ("5h"). The long window is provider-aware: most providers report a
+// 7-day rolling window ("7d"); Z.AI's long window is monthly ("monthly",
+// see issue #138) because its upstream TIME_LIMIT entry is the monthly
+// quota. The snapshot's unified_7d_* fields are still the right data
+// shape for any long window; only the human label moves.
+type WindowLabels struct {
+	Short string // "5h"
+	Long  string // "7d" or "monthly"
+}
+
+// WindowLabelsFor returns the per-pool rolling-window label hint the UI
+// consumes to render the long-window column. The default is the
+// Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
+// #138), so a Z.AI backend gets "5h" / "monthly". Unknown providers and
+// an empty base URL fall back to the default.
+//
+// Centralised here so both the auto package (building PoolConfigView)
+// and the main package (building poolQuotaView) can share one mapping:
+// adding a new provider with a non-7d long window is a one-line change
+// at the only switch on provider name.
+func WindowLabelsFor(baseURL string) WindowLabels {
+	if p, ok := ProviderFor(baseURL); ok {
+		switch p.Name() {
+		case "z.ai/zhipu":
+			return WindowLabels{Short: "5h", Long: "monthly"}
+		}
+	}
+	return WindowLabels{Short: "5h", Long: "7d"}
+}
+
 // provider describes how to poll one proprietary quota API. The set is a
 // registry: adding support for a new API means appending one entry to
 // providers, with no change to the poll loop.
@@ -524,6 +562,17 @@ func hmacSHA256(key []byte, data string) []byte {
 // TOKENS_LIMIT is the short (5h-equivalent) window and TIME_LIMIT is the
 // long window. percentage is the *used* fraction in 0..100, so it maps to
 // utilization by dividing by 100. nextResetTime is epoch milliseconds.
+//
+// Z.AI's TIME_LIMIT is the **monthly** quota, not a 7-day rolling window
+// (issue #138). We keep storing it in the Unified7d* snapshot slot — that
+// is the right data shape for a long-window utilization + reset — and let
+// the UI label the column "monthly" for Z.AI pools (see
+// poolQuotaView.WindowLabels in cmd/agent-quota-gateway/main.go).
+//
+// Any limit type that is not one of the two explicitly recognised ones
+// (e.g. an upstream "MONTHLY_LIMIT" or "MONTH_LIMIT" string Z.AI may add
+// later) falls into the long-window slot rather than being dropped, so a
+// new upstream type does not silently lose data.
 func parseZhipu(body []byte, now time.Time) (quota.Snapshot, error) {
 	var resp struct {
 		Data struct {
@@ -544,8 +593,19 @@ func parseZhipu(body []byte, now time.Time) (quota.Snapshot, error) {
 			snap.Unified5hUtilization = floatPtr(l.Percentage / 100)
 			snap.Unified5hReset = msToTime(l.NextResetTime)
 		case "TIME_LIMIT":
+			// Monthly for Z.AI; long window in the snapshot.
 			snap.Unified7dUtilization = floatPtr(l.Percentage / 100)
 			snap.Unified7dReset = msToTime(l.NextResetTime)
+		default:
+			// Defensive: any other Z.AI limit type (e.g. "MONTHLY_LIMIT")
+			// goes into the long-window slot rather than being dropped, so
+			// the snapshot still surfaces whatever the upstream returned.
+			// The first such entry wins; Z.AI only ever ships one long
+			// window, but we tolerate multiple without panicking.
+			if snap.Unified7dUtilization == nil {
+				snap.Unified7dUtilization = floatPtr(l.Percentage / 100)
+				snap.Unified7dReset = msToTime(l.NextResetTime)
+			}
 		}
 	}
 	if !snap.HasData() {

@@ -386,6 +386,20 @@ func healthHandler() http.HandlerFunc {
 	}
 }
 
+// WindowLabels is a local alias for poller.WindowLabels so the JSON
+// shape stays package-local. The mapping itself (z.ai/zhipu → monthly,
+// everything else → 7d) lives in poller.WindowLabelsFor — adding a new
+// provider with a non-7d long window is a one-line change there, and
+// both this server and the auto package pick it up automatically.
+type WindowLabels = poller.WindowLabels
+
+// WindowLabelsFor returns the per-pool rolling-window label hint the UI
+// consumes to render the long-window column. Wraps poller.WindowLabelsFor
+// so the JSON-tagged alias above can stay a one-liner.
+func WindowLabelsFor(baseURL string) WindowLabels {
+	return poller.WindowLabelsFor(baseURL)
+}
+
 // poolQuotaView is the /_gateway/quota?backend=<pool> response: the
 // pool's active sticky member's snapshot with an added active_backend
 // field naming the member nick. The embedded Snapshot promotes its
@@ -393,9 +407,16 @@ func healthHandler() http.HandlerFunc {
 // gets the active member's snapshot plus the member's name — it needs
 // zero knowledge of pool membership, and the 99%->5% jump on a switch is
 // self-explained because active_backend changes alongside it.
+//
+// WindowLabels is per-pool because the long-window column means different
+// things for different providers: a 7-day rolling window for Anthropic
+// and MiniMaxi, a monthly window for Z.AI (issue #138). The snapshot
+// struct's 5h/7d field names stay — they are the right data shape; only
+// the human-facing label changes.
 type poolQuotaView struct {
 	quota.Snapshot
-	ActiveBackend string `json:"active_backend"`
+	ActiveBackend string        `json:"active_backend"`
+	WindowLabels  WindowLabels  `json:"window_labels"`
 }
 
 // quotaHandler returns the JSON snapshot for the requested pool.
@@ -423,6 +444,7 @@ func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 				_ = json.NewEncoder(w).Encode(poolQuotaView{
 					Snapshot:      store.Get(b.QuotaKey()),
 					ActiveBackend: b.Nick,
+					WindowLabels:  WindowLabelsFor(b.BaseURL),
 				})
 				return
 			}
