@@ -267,10 +267,13 @@ type PoolConfigView struct {
 	WindowLabels *PoolWindowLabels `json:"window_labels,omitempty"`
 }
 
-// PoolWindowLabels describes how the UI should label the two
-// rolling-window columns in the members table. The values are populated
-// at config-build time by main.WindowLabelsFor(baseURL), keeping the
-// provider→label mapping in one place.
+// PoolWindowLabels is the per-pool rolling-window label hint the UI
+// consumes to render the long-window column. The field names are
+// `short` / `long` to match the JSON the UI reads (it is the same hint
+// /_gateway/config surfaces in the `window_labels` object). The
+// mapping itself lives in poller.WindowLabelsFor; this local type
+// exists so the auto package can keep the JSON shape independent of
+// any future field additions in poller.WindowLabels.
 type PoolWindowLabels struct {
 	Short string `json:"short"` // e.g. "5h"
 	Long  string `json:"long"`  // e.g. "7d" or "monthly"
@@ -2945,11 +2948,6 @@ func randIndex(n int) int {
 // adding a new provider touches both at once. A test in
 // cmd/agent-quota-gateway/main_test.go covers the consumer side.
 func poolWindowLabelsFor(baseURL string) PoolWindowLabels {
-	if p, ok := poller.ProviderFor(baseURL); ok {
-		switch p.Name() {
-		case "z.ai/zhipu":
-			return PoolWindowLabels{Short: "5h", Long: "monthly"}
-		}
-	}
-	return PoolWindowLabels{Short: "5h", Long: "7d"}
+	l := poller.WindowLabelsFor(baseURL)
+	return PoolWindowLabels{Short: l.Short, Long: l.Long}
 }

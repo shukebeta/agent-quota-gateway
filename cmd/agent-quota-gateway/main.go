@@ -386,30 +386,18 @@ func healthHandler() http.HandlerFunc {
 	}
 }
 
-// WindowLabels describes how the UI should label the two rolling-window
-// columns in the pool table. Most providers label the long window "7d",
-// but Z.AI's long window is monthly (see issue #138) — the snapshot
-// struct still uses the 5h/7d field names (right data shape for any long
-// window), but the column header has to be honest about what the upstream
-// actually returned.
-type WindowLabels struct {
-	Short string `json:"short"` // e.g. "5h"
-	Long  string `json:"long"`  // e.g. "7d" or "monthly"
-}
+// WindowLabels is a local alias for poller.WindowLabels so the JSON
+// shape stays package-local. The mapping itself (z.ai/zhipu → monthly,
+// everything else → 7d) lives in poller.WindowLabelsFor — adding a new
+// provider with a non-7d long window is a one-line change there, and
+// both this server and the auto package pick it up automatically.
+type WindowLabels = poller.WindowLabels
 
-// WindowLabelsFor returns the per-pool window-label hint the UI consumes
-// to render the second rolling-window column. The default is the
-// Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
-// #138), so a Z.AI backend gets "5h" / "monthly". Unknown providers fall
-// back to the default; an empty base URL is treated as no provider.
+// WindowLabelsFor returns the per-pool rolling-window label hint the UI
+// consumes to render the long-window column. Wraps poller.WindowLabelsFor
+// so the JSON-tagged alias above can stay a one-liner.
 func WindowLabelsFor(baseURL string) WindowLabels {
-	if p, ok := poller.ProviderFor(baseURL); ok {
-		switch p.Name() {
-		case "z.ai/zhipu":
-			return WindowLabels{Short: "5h", Long: "monthly"}
-		}
-	}
-	return WindowLabels{Short: "5h", Long: "7d"}
+	return poller.WindowLabelsFor(baseURL)
 }
 
 // poolQuotaView is the /_gateway/quota?backend=<pool> response: the

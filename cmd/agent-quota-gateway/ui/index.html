@@ -231,21 +231,52 @@
   .status[data-status="disabled"] { color: var(--muted); }
   .status[data-status="idle"] { color: var(--accent); border-color: var(--accent); }
 
+  /* Per-member enable/disable control. Encodes the member's *current* state,
+     not the action the click will perform. The click still routes through
+     toggleMember() at index.html:866 and the /enable / /disable endpoints. */
   .toggle {
-    border: 1px solid var(--border);
-    background: var(--panel);
-    color: var(--text);
-    border-radius: 4px;
-    padding: 3px 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 0;
+    padding: 0;
     cursor: pointer;
-    font-size: 12px;
+    font: inherit;
+    color: var(--text);
   }
   .toggle[disabled] { color: var(--muted); }
-  .toggle[data-state="enabled"] { color: var(--danger); border-color: var(--danger); }
-  .toggle[data-state="enabled"]:hover { background: rgba(207, 34, 46, 0.08); }
-  .toggle[data-state="disabled"] { color: var(--ok); border-color: var(--ok); }
-  .toggle[data-state="disabled"]:hover { background: rgba(26, 127, 55, 0.08); }
   .toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+  .toggle-track {
+    position: relative;
+    width: 30px;
+    height: 16px;
+    border-radius: 999px;
+    background: var(--muted);
+    transition: background 120ms ease;
+    flex: 0 0 auto;
+  }
+  .toggle[data-state="enabled"] .toggle-track { background: var(--accent); }
+  .toggle-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+    transition: transform 120ms ease;
+  }
+  .toggle[data-state="enabled"] .toggle-thumb { transform: translateX(14px); }
+  .toggle-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    min-width: 22px;
+  }
+  .toggle[data-state="enabled"] .toggle-label { color: var(--accent); }
+  .toggle:hover:not(:disabled) .toggle-thumb { box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.25); }
 
   .empty {
     color: var(--muted);
@@ -592,9 +623,6 @@
 
       // Quota cells start as "-"; applyLiveStatus() fills them from
       // /_gateway/pool once a snapshot exists (config carries no snapshot).
-      // The 5h / 5h-reset cells stay hard-coded; the long-window cells
-      // keep the snapshot's unified_7d_* fields (right data shape) but
-      // surface as "monthly" or whatever the pool's label says.
       var td5h = document.createElement('td');
       td5h.className = 'quota';
       td5h.setAttribute('data-role', 'quota-5h');
@@ -607,6 +635,9 @@
       td5hr.textContent = '-';
       tr.appendChild(td5hr);
 
+      // The 5h / 5h-reset cells stay hard-coded; the long-window cells
+      // keep the snapshot's unified_7d_* fields (right data shape) but
+      // surface as "monthly" or whatever the pool's label says.
       var tdLong = document.createElement('td');
       tdLong.className = 'quota';
       tdLong.setAttribute('data-role', 'quota-long');
@@ -628,7 +659,21 @@
       btn.className = 'toggle';
       btn.setAttribute('data-role', 'toggle');
       btn.setAttribute('data-state', m.disabled ? 'disabled' : 'enabled');
-      btn.textContent = m.disabled ? 'Enable' : 'Disable';
+      btn.setAttribute('role', 'switch');
+      btn.setAttribute('aria-checked', m.disabled ? 'false' : 'true');
+      btn.setAttribute('aria-label', m.disabled ? 'Enable member' : 'Disable member');
+      var track = document.createElement('span');
+      track.className = 'toggle-track';
+      track.setAttribute('aria-hidden', 'true');
+      var thumb = document.createElement('span');
+      thumb.className = 'toggle-thumb';
+      thumb.setAttribute('aria-hidden', 'true');
+      track.appendChild(thumb);
+      btn.appendChild(track);
+      var labelEl = document.createElement('span');
+      labelEl.className = 'toggle-label';
+      labelEl.textContent = m.disabled ? 'Off' : 'On';
+      btn.appendChild(labelEl);
       btn.addEventListener('click', function () {
         toggleMember(view.pool, m.nick, !m.disabled);
       });

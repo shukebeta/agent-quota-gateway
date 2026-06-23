@@ -205,6 +205,38 @@ func (p *Poller) pollOne(ctx context.Context, prov provider, b backend.Backend) 
 // is monthly for z.ai/zhipu, weekly for everything else).
 func (p provider) Name() string { return p.name }
 
+// WindowLabels describes how the UI should label the two rolling-window
+// columns in the pool table. The short window is always the 5h-equivalent
+// ("5h"). The long window is provider-aware: most providers report a
+// 7-day rolling window ("7d"); Z.AI's long window is monthly ("monthly",
+// see issue #138) because its upstream TIME_LIMIT entry is the monthly
+// quota. The snapshot's unified_7d_* fields are still the right data
+// shape for any long window; only the human label moves.
+type WindowLabels struct {
+	Short string // "5h"
+	Long  string // "7d" or "monthly"
+}
+
+// WindowLabelsFor returns the per-pool rolling-window label hint the UI
+// consumes to render the long-window column. The default is the
+// Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
+// #138), so a Z.AI backend gets "5h" / "monthly". Unknown providers and
+// an empty base URL fall back to the default.
+//
+// Centralised here so both the auto package (building PoolConfigView)
+// and the main package (building poolQuotaView) can share one mapping:
+// adding a new provider with a non-7d long window is a one-line change
+// at the only switch on provider name.
+func WindowLabelsFor(baseURL string) WindowLabels {
+	if p, ok := ProviderFor(baseURL); ok {
+		switch p.Name() {
+		case "z.ai/zhipu":
+			return WindowLabels{Short: "5h", Long: "monthly"}
+		}
+	}
+	return WindowLabels{Short: "5h", Long: "7d"}
+}
+
 // provider describes how to poll one proprietary quota API. The set is a
 // registry: adding support for a new API means appending one entry to
 // providers, with no change to the poll loop.
