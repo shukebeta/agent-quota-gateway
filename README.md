@@ -569,7 +569,7 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 
 | Value | Meaning |
 |-------|---------|
-| `active` | Currently selected by the sticky pointer |
+| `active` | Currently selected by the sticky pointer **and** available — `exhausted` outranks `active`, so a sticky member that is also parked reports `exhausted`, not `active` |
 | `exhausted` | Parked — either a live-429 park or store-driven exhaustion; `exhausted_until` is the reset time |
 | `idle` | Healthy and not currently active |
 

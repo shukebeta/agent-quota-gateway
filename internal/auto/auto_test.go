@@ -894,6 +894,67 @@ func TestPools_poolStatus(t *testing.T) {
 	}
 }
 
+// TestPools_stickyParkedReportsExhausted is the regression for issue #146:
+// when the pool's sticky member is itself parked, both /_gateway/pool
+// (poolStatus) and /_gateway/config (EffectiveConfig) must report it
+// "exhausted", not "active" — matching the routing path, which 429s it.
+func TestPools_stickyParkedReportsExhausted(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	// Single-member pool: after a 429 there is nowhere to fail over, so the
+	// sticky pointer stays on the parked member a — exactly the sticky+parked
+	// case the old "active"-before-"exhausted" ordering misreported.
+	c := newController(t, 0, clock, io.Discard, "a")
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	store := quota.NewStore()
+
+	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, time.Hour)); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	// /_gateway/pool view.
+	status, ok := pools.PoolStatus("auto", store)
+	if !ok {
+		t.Fatal("PoolStatus returned ok=false")
+	}
+	if status.Active != "a" {
+		t.Fatalf("Active=%q, want a (sticky pointer stays on the only member)", status.Active)
+	}
+	var a *MemberStatus
+	for i := range status.Members {
+		if status.Members[i].Nick == "a" {
+			a = &status.Members[i]
+		}
+	}
+	if a == nil {
+		t.Fatal("member a missing from PoolStatus")
+	}
+	if a.Status != "exhausted" {
+		t.Errorf("poolStatus a status=%q, want exhausted (sticky+parked)", a.Status)
+	}
+	if a.ExhaustedUntil == nil {
+		t.Error("poolStatus exhausted member should populate ExhaustedUntil")
+	}
+
+	// /_gateway/config view.
+	cfgStatus, found := "", false
+	for _, v := range pools.EffectiveConfig() {
+		if v.Pool != "auto" {
+			continue
+		}
+		for _, m := range v.Members {
+			if m.Nick == "a" {
+				cfgStatus, found = m.Status, true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("member a missing from EffectiveConfig")
+	}
+	if cfgStatus != "exhausted" {
+		t.Errorf("EffectiveConfig a status=%q, want exhausted (sticky+parked)", cfgStatus)
+	}
+}
+
 // TestPools_poolStatus_unknownReturnsNotFound verifies ok=false for unknown pool.
 func TestPools_poolStatus_unknownReturnsNotFound(t *testing.T) {
 	pools := &Pools{byPool: map[string]*Controller{}}

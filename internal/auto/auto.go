@@ -933,16 +933,20 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 			}
 			// Determine status. Removed members are already excluded from
 			// allMembers above, so only the disabled flag maps to "disabled".
+			// exhausted is checked before the sticky (curNick) arm so that
+			// "active" means the sticky member that is ALSO available: a sticky
+			// member that is parked reports exhausted, matching poolStatus and
+			// the selection path (isUnavailableLocked), which all use the
+			// controller clock and treat a parked member as unavailable.
 			if c.disabled[nick] {
 				member.Status = "disabled"
+			} else if _, ok := c.exhaustedUntilLocked(nick); ok {
+				// exhaustedUntilLocked returns ok=false once the park elapses by
+				// c.now(), so it is the single source of truth for the exhausted
+				// status across this view, poolStatus, and the selection path.
+				member.Status = "exhausted"
 			} else if nick == curNick {
 				member.Status = "active"
-			} else if _, ok := c.exhaustedUntilLocked(nick); ok {
-				// exhaustedUntilLocked already returns ok=false once the park
-				// elapses by c.now(), so it is the single source of truth for
-				// the exhausted status — consistent with poolStatus and the
-				// selection path, which all use the controller clock.
-				member.Status = "exhausted"
 			} else {
 				member.Status = "idle"
 			}
@@ -1632,14 +1636,19 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 	members := make([]MemberStatus, 0, len(effective))
 	for _, nick := range effective {
 		ms := MemberStatus{Nick: nick}
+		// exhausted is checked before the sticky (curNick) arm: "active" must
+		// mean the sticky member that is ALSO currently available. A sticky
+		// member that is parked is treated as unavailable by the routing path
+		// (isUnavailableLocked → exhaustedUntilLocked), which 429s it, so it
+		// must report exhausted here too — not a green "active" badge.
 		if c.disabled[nick] {
 			ms.Status = "disabled"
-		} else if nick == curNick {
-			ms.Status = "active"
 		} else if reset, ok := c.exhaustedUntilLocked(nick); ok {
 			ms.Status = "exhausted"
 			r := reset.UTC()
 			ms.ExhaustedUntil = &r
+		} else if nick == curNick {
+			ms.Status = "active"
 		} else {
 			ms.Status = "idle"
 		}
