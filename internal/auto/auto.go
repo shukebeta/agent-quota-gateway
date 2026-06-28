@@ -225,6 +225,17 @@ func (p *Pools) ClearExhausted(poolName string) (cleared []string, ok bool) {
 	return c.ClearExhausted(), true
 }
 
+// ClearExhaustedNick drops one member's live-429 park in the named pool (see
+// Controller.ClearExhaustedNick). ok is false for an unknown pool; cleared
+// reports whether a live park was actually present for the nick.
+func (p *Pools) ClearExhaustedNick(poolName, nick string) (cleared bool, ok bool) {
+	c, ok := p.controller(poolName)
+	if !ok {
+		return false, false
+	}
+	return c.ClearExhaustedNick(nick), true
+}
+
 // ClearAllExhausted drops live-429 parks across every pool, returning a
 // map of pool name to the nicks cleared (pools with nothing parked are
 // omitted).
@@ -244,6 +255,15 @@ type MemberStatus struct {
 	Status         string          `json:"status"`          // "active", "exhausted", "idle"
 	ExhaustedUntil *time.Time      `json:"exhausted_until"` // RFC 3339 or null
 	Snapshot       *quota.Snapshot `json:"snapshot"`        // null when no snapshot recorded
+
+	// Parked reports whether a live-429 park is currently holding this member
+	// out of rotation — present, reset still in the future, and not reconciled
+	// away by a fresh healthy store snapshot (issue #145). It is the gate for
+	// the per-nick "clear park" affordance (issue #147): exactly the set of
+	// parks ClearExhaustedNick can usefully drop. Distinct from Status:
+	// store-sourced exhaustion also reads "exhausted" but is not Parked, since
+	// clearing the live park cannot move it.
+	Parked bool `json:"parked"`
 
 	// Lead fields are populated only for pools in balanced mode.
 	// Lead is max(Lead5h, Lead7d) over known windows; null when no data.
@@ -1523,6 +1543,27 @@ func (c *Controller) ClearExhausted() []string {
 	return cleared
 }
 
+// ClearExhaustedNick drops a single member's live-429 park (issue #147), the
+// per-nick counterpart to ClearExhausted: an operator escape hatch to un-stick
+// one over-parked member without clearing the whole pool. Same "live-park only,
+// never store" contract — store-sourced exhaustion is left untouched and a
+// genuinely-exhausted member simply re-parks via record429 on its next 429.
+// Returns whether a live park was actually present (false is a harmless no-op
+// for an unknown or un-parked nick). notifyMutate fires only when something
+// changed.
+func (c *Controller) ClearExhaustedNick(nick string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.exhausted[nick]; !ok {
+		return false
+	}
+	delete(c.exhausted, nick)
+	delete(c.lastProbeAttempt, nick)
+	delete(c.probeInFlight, nick)
+	c.notifyMutate()
+	return true
+}
+
 // Current returns the nick of the active sticky backend, or "" for a
 // member-less pool (a freshly created runtime pool with nothing to route to).
 func (c *Controller) Current() string {
@@ -1652,6 +1693,7 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 		} else {
 			ms.Status = "idle"
 		}
+		ms.Parked = c.liveParkActiveLocked(nick)
 		if b, ok := c.backendByNickLocked(nick); ok {
 			// Only attach a snapshot when this controller has itself observed
 			// traffic (or polled) for this nick. PR #113 makes the store key
@@ -2283,8 +2325,8 @@ func (c *Controller) SetProbeHTTPClient(client *http.Client) {
 // not block other pool operations.
 func (c *Controller) tryRecoverParked() string {
 	type probeTarget struct {
-		nick      string
-		quotaKey  string
+		nick     string
+		quotaKey string
 	}
 	var targets []probeTarget
 	now := c.now()
@@ -2402,6 +2444,21 @@ func (c *Controller) clearExpiredLocked() {
 func (c *Controller) isExhaustedLocked(nick string) bool {
 	_, ok := c.exhaustedUntilLocked(nick)
 	return ok
+}
+
+// liveParkActiveLocked reports whether a live-429 park is currently holding
+// nick out of rotation: an entry in c.exhausted whose reset has not elapsed and
+// which the fresh store has not reconciled away (issue #145). It is the gate
+// for MemberStatus.Parked / the per-nick clear button (issue #147) — the exact
+// condition under which ClearExhaustedNick has a park to drop AND that park is
+// what is keeping the member parked. Store-sourced exhaustion is deliberately
+// excluded: clearing the live park cannot move it. Caller holds c.mu.
+func (c *Controller) liveParkActiveLocked(nick string) bool {
+	reset, ok := c.exhausted[nick]
+	if !ok || !c.now().Before(reset) {
+		return false
+	}
+	return !c.storeReconcilesParkLocked(nick)
 }
 
 // exhaustedUntilLocked returns the time nick stays unselectable and whether

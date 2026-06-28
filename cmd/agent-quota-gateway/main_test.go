@@ -703,6 +703,78 @@ func TestPoolHandler_methodGuard(t *testing.T) {
 	}
 }
 
+// TestClearHandler_nickRouting verifies the per-nick clear routing on
+// POST /_gateway/clear (issue #147): the nick query param, the guard that
+// rejects a nick without a pool BEFORE the all-pools branch, unknown-pool 404,
+// the un-parked no-op, and that the pool-level and all-pools paths are
+// unchanged when no nick is given.
+func TestClearHandler_nickRouting(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	srv := httptest.NewServer(clearHandler(pools))
+	t.Cleanup(srv.Close)
+
+	post := func(query string) (int, map[string]any) {
+		resp, err := http.Post(srv.URL+"/_gateway/clear"+query, "", nil)
+		if err != nil {
+			t.Fatalf("post %q: %v", query, err)
+		}
+		defer resp.Body.Close()
+		var body map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body
+	}
+
+	// nick without pool must 400 — never fall through to the all-pools branch.
+	if code, body := post("?nick=a"); code != http.StatusBadRequest {
+		t.Errorf("nick without pool: status=%d body=%v, want 400", code, body)
+	}
+
+	// nick with unknown pool → 404 pool not found.
+	if code, body := post("?pool=nope&nick=a"); code != http.StatusNotFound {
+		t.Errorf("nick with unknown pool: status=%d body=%v, want 404", code, body)
+	}
+
+	// nick with known pool but no live park → 200 no-op, cleared:false.
+	code, body := post("?pool=auto&nick=a")
+	if code != http.StatusOK {
+		t.Fatalf("per-nick clear: status=%d, want 200", code)
+	}
+	if body["pool"] != "auto" || body["nick"] != "a" {
+		t.Errorf("per-nick clear body=%v, want pool=auto nick=a", body)
+	}
+	if cleared, _ := body["cleared"].(bool); cleared {
+		t.Errorf("per-nick clear cleared=true, want false (nothing parked)")
+	}
+
+	// No nick: pool-level clear still returns the pool's cleared list shape.
+	code, body = post("?pool=auto")
+	if code != http.StatusOK {
+		t.Fatalf("pool-level clear: status=%d, want 200", code)
+	}
+	if body["pool"] != "auto" {
+		t.Errorf("pool-level clear pool=%v, want auto", body["pool"])
+	}
+	if _, hasNick := body["nick"]; hasNick {
+		t.Errorf("pool-level clear unexpectedly carries nick=%v", body["nick"])
+	}
+
+	// No params: all-pools clear returns the cleared map under "cleared".
+	code, body = post("")
+	if code != http.StatusOK {
+		t.Fatalf("all-pools clear: status=%d, want 200", code)
+	}
+	if _, ok := body["cleared"]; !ok {
+		t.Errorf("all-pools clear missing cleared key, body=%v", body)
+	}
+}
+
 // TestPersist_roundTrip verifies that persisted state survives a simulated
 // restart: write state to a file, reload it, and confirm sticky + snapshots
 // are restored.
