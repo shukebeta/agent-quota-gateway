@@ -64,6 +64,17 @@ const exhaustionUtilizationThreshold = 1.0
 // authoritative exhaustion signal. See windowBlocks.
 const unifiedStatusRejected = "rejected"
 
+// storeSnapshotFreshness bounds how recent a polled quota snapshot must be
+// for it to retire a stale live-429 park (issue #145). The poller refreshes
+// the active member every defaultInterval (2m) and organic proxy traffic
+// refreshes it continuously, so a member still being served reads fresh well
+// within this 5m bound. A failed-off member the poller no longer tracks (it
+// polls only the active member) freezes its snapshot and crosses this bound
+// within a few minutes, falling back to wall-clock park aging — the
+// load-bearing safety guard that keeps stale data from second-guessing a
+// live park. See storeReconcilesParkLocked.
+const storeSnapshotFreshness = 5 * time.Minute
+
 // switchRetryAfterSeconds is the Retry-After the synthetic 503 carries
 // when a pool switches members. It is deliberately short: the switch is
 // instantaneous server-side, so the client should retry almost
@@ -2395,12 +2406,57 @@ func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 	if ok && !c.now().Before(reset) {
 		ok = false // park already elapsed
 	}
+	// Store-driven reconciliation of a stale live park (issue #145): when the
+	// polled store holds FRESH, non-blocking data for the member, the live 429
+	// park is stale — its 429-sourced reset overshot the real quota window
+	// (Z.AI's unified-reset runs ~2h52m past the dashboard 5h reset). Retire
+	// the live park so the member becomes selectable now, rather than holding
+	// the pool in 429 until the 429's reset. Non-destructive: c.exhausted is
+	// left in place, so a later stale snapshot or a fresh 429 (via record429)
+	// re-asserts the park. The freshness gate is the safety guard — an empty
+	// or frozen snapshot (the poller tracks only the active member) keeps the
+	// park aging by wall-clock. See storeReconcilesParkLocked.
+	if ok && c.storeReconcilesParkLocked(nick) {
+		ok = false
+	}
 	if sReset, sOK := c.storeExhaustedUntilLocked(nick); sOK {
 		if !ok || sReset.After(reset) {
 			reset, ok = sReset, true
 		}
 	}
 	return reset, ok
+}
+
+// storeReconcilesParkLocked reports whether the polled quota store is fresh
+// and healthy enough to retire a member's stale live-429 park (issue #145).
+// It is true only when the store holds the member's data (HasData), that
+// snapshot is recent (within storeSnapshotFreshness of now), AND it shows no
+// blocking window (snapRejects == false). It returns false for a nil store,
+// an unknown nick, an empty snapshot (store.Get on a missing key returns a
+// stamped-but-empty snapshot whose !snapRejects would otherwise read healthy),
+// a frozen/stale snapshot (the poller refreshes only the active member, so a
+// failed-off member's entry freezes — it must keep aging by wall-clock), or a
+// snapshot whose window still blocks. Because !snapRejects is strictly more
+// conservative than the storeExhaustedUntilLocked union, this short-circuit
+// and that union can never both fire. Caller holds c.mu; the store has its
+// own lock and never calls back into the controller.
+func (c *Controller) storeReconcilesParkLocked(nick string) bool {
+	if c.store == nil {
+		return false
+	}
+	idx := c.indexOf(nick)
+	if idx < 0 {
+		return false
+	}
+	snap := c.store.Get(c.backendAt(idx).QuotaKey())
+	if !snap.HasData() {
+		return false
+	}
+	now := c.now()
+	if now.Sub(snap.AsOf) > storeSnapshotFreshness {
+		return false // frozen / stale snapshot — do not second-guess the park
+	}
+	return !snapRejects(snap, now)
 }
 
 // storeExhaustedUntilLocked reports nick's window reset when the quota store

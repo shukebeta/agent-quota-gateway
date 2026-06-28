@@ -466,6 +466,183 @@ func TestStoreExhaustedUntil_rejectedStatusWithNilResetSkipsWindow(t *testing.T)
 	}
 }
 
+// putFresh files a fresh (AsOf=now), non-blocking 5h snapshot for nick —
+// the shape a healthy poller-tracked member reports while still being
+// served. Used by the issue #145 store-reconciliation tests, which need the
+// snapshot's AsOf set explicitly rather than coupled to the reset (putUtil
+// stamps AsOf=reset-1h, which would read stale for a near-future reset).
+func putFresh(t *testing.T, store *quota.Store, c *Controller, nick string, util float64, reset, asOf time.Time) {
+	t.Helper()
+	store.Put(c.resolve(t, nick).QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hReset:       &reset,
+		AsOf:                 asOf,
+	})
+}
+
+// TestReconcile_freshHealthyStoreRetiresStalePark is the core issue #145
+// regression: a live-429 park whose reset is still in the future is retired
+// the moment the polled store shows the member fresh and non-blocking, so the
+// member stops being reported exhausted (the Z.AI over-park self-heal).
+func TestReconcile_freshHealthyStoreRetiresStalePark(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	c.park("a", clock.now().Add(3*time.Hour))                      // live-429 park, future reset
+	putFresh(t, store, c, "a", 0.61, clock.now().Add(time.Hour), clock.now()) // fresh, below cap
+
+	if got, ok := c.exhaustedUntil("a"); ok {
+		t.Errorf("exhaustedUntil = %v,true, want _,false (fresh healthy store retires the stale park)", got)
+	}
+}
+
+// TestReconcile_noStoreDataStaysParked proves the freshness gate's first
+// guard: with no store data for the member, the live park must keep aging by
+// wall-clock — an empty snapshot (!snapRejects is trivially true) must never
+// un-park.
+func TestReconcile_noStoreDataStaysParked(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	parkAt := clock.now().Add(3 * time.Hour)
+	c.park("a", parkAt) // no store.Put — the store has nothing for a
+
+	got, ok := c.exhaustedUntil("a")
+	if !ok || !got.Equal(parkAt) {
+		t.Errorf("exhaustedUntil = %v,%v, want %v,true (no store data → wall-clock park holds)", got, ok, parkAt)
+	}
+}
+
+// TestReconcile_storeBlockingStaysParked proves the short-circuit defers to a
+// store that still blocks: a fresh at-cap snapshot (future reset) keeps the
+// member parked, and the union returns the later store reset — the reconcile
+// and the storeExhaustedUntilLocked union can never both fire.
+func TestReconcile_storeBlockingStaysParked(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	parkAt := clock.now().Add(time.Hour)
+	storeAt := clock.now().Add(3 * time.Hour) // later, and blocking (at cap)
+	c.park("a", parkAt)
+	putFresh(t, store, c, "a", 1.0, storeAt, clock.now()) // fresh but at cap → blocks
+
+	got, ok := c.exhaustedUntil("a")
+	if !ok || !got.Equal(storeAt) {
+		t.Errorf("exhaustedUntil = %v,%v, want %v,true (fresh store still blocks → later store reset)", got, ok, storeAt)
+	}
+}
+
+// TestReconcile_staleHealthyStoreStaysParked proves the load-bearing
+// freshness guard: a snapshot that reads healthy but whose AsOf is older than
+// storeSnapshotFreshness (the poller stopped tracking a failed-off member, so
+// its entry froze) must NOT second-guess the live park — it ages by
+// wall-clock like before.
+func TestReconcile_staleHealthyStoreStaysParked(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	parkAt := clock.now().Add(3 * time.Hour)
+	c.park("a", parkAt)
+	// Healthy snapshot, but AsOf is beyond the freshness window → stale.
+	putFresh(t, store, c, "a", 0.61, clock.now().Add(time.Hour),
+		clock.now().Add(-(storeSnapshotFreshness + time.Minute)))
+
+	got, ok := c.exhaustedUntil("a")
+	if !ok || !got.Equal(parkAt) {
+		t.Errorf("exhaustedUntil = %v,%v, want %v,true (stale snapshot must not un-park)", got, ok, parkAt)
+	}
+}
+
+// TestReconcile_genuine429ReparksViaStore is the issue AC (d) re-park guard.
+// The reconcile is non-destructive (c.exhausted is left in place), so a
+// member that genuinely 429s after being reconciled re-parks. In production
+// the genuine 429 carries blocking rate-limit headers that the response
+// observer writes to the store BEFORE record429 runs, so the store flips to
+// blocking; the next exhaustedUntilLocked sees the store reject and the live
+// park holds again. (record429 alone, with the store still fresh-healthy,
+// would be re-reconciled away — the store is authoritative for Z.AI by
+// design; the genuine 429 re-parks precisely because it refreshes the store.)
+func TestReconcile_genuine429ReparksViaStore(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	// 1. Reconciled: fresh-healthy store retires the live park.
+	c.park("a", clock.now().Add(3*time.Hour))
+	putFresh(t, store, c, "a", 0.61, clock.now().Add(time.Hour), clock.now())
+	if _, ok := c.exhaustedUntil("a"); ok {
+		t.Fatalf("precondition: a should be reconciled (not exhausted) before the genuine 429")
+	}
+
+	// 2. Genuine 429: the observer refreshes the store to a blocking snapshot,
+	//    then record429 sets a fresh live park.
+	putFresh(t, store, c, "a", 1.0, clock.now().Add(2*time.Hour), clock.now()) // at cap → blocks
+	c.record429("a", clock.now().Add(2*time.Hour))
+
+	if _, ok := c.exhaustedUntil("a"); !ok {
+		t.Errorf("exhaustedUntil = _,false, want _,true (genuine 429 refreshed the store → re-parked)")
+	}
+}
+
+// TestReconcile_soleMemberRoutesAfterReconcile proves routing agrees: a
+// sole-member pool whose only member is live-parked but fresh-healthy in the
+// store returns exhausted=false and forwards to it, instead of 429ing until
+// the stale live-park reset (the chn/ccz case).
+func TestReconcile_soleMemberRoutesAfterReconcile(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a"), "auto", 0, store, clock.now, io.Discard)
+
+	c.park("a", clock.now().Add(3*time.Hour))
+	putFresh(t, store, c, "a", 0.61, clock.now().Add(time.Hour), clock.now())
+
+	b, retry, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatalf("ResolveAuto exhausted=true, want false (sole member reconciled healthy)")
+	}
+	if retry != 0 {
+		t.Errorf("ResolveAuto retry=%v, want 0", retry)
+	}
+	if b.Nick != "a" {
+		t.Errorf("ResolveAuto picked %q, want a", b.Nick)
+	}
+}
+
+// TestReconcile_poolStatusFlipsNonStickyMember proves routing and the
+// /_gateway/pool UI agree through the shared exhaustedUntilLocked chokepoint.
+// A NON-sticky parked member is used deliberately: poolStatus returns
+// "active" for the sticky member before it ever reaches exhaustedUntilLocked,
+// so only a non-sticky member exercises the reconcile on the UI path. Its
+// status flips "exhausted" -> "idle" once the store reads fresh-healthy.
+func TestReconcile_poolStatusFlipsNonStickyMember(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard) // sticky on a
+
+	c.park("b", clock.now().Add(3*time.Hour)) // b is non-sticky and parked
+
+	byNick := func() map[string]MemberStatus {
+		m := make(map[string]MemberStatus)
+		for _, ms := range c.poolStatus(store).Members {
+			m[ms.Nick] = ms
+		}
+		return m
+	}
+
+	if got := byNick()["b"].Status; got != "exhausted" {
+		t.Fatalf("b status=%q before reconcile, want exhausted", got)
+	}
+
+	putFresh(t, store, c, "b", 0.61, clock.now().Add(time.Hour), clock.now())
+	if got := byNick()["b"].Status; got != "idle" {
+		t.Errorf("b status=%q after fresh-healthy store, want idle (reconciled)", got)
+	}
+}
+
 // TestStoreExhaustion_runtimePriorityPreemptsBack proves that a pool with
 // no static PRIORITY declaration, given a runtime priority via SetPriority,
 // correctly preempts back to a recovered higher-priority member. This is the

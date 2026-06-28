@@ -495,7 +495,15 @@ its own body:
   `anthropic-ratelimit-unified-reset` header when present, otherwise a
   conservative 5-hour window). The sticky pointer is pre-pointed at that
   soonest member so the client's post-wait retry lands on it. An exhausted
-  mark clears automatically once its reset time passes.
+  mark clears automatically once its reset time passes — or earlier, the
+  moment the polled quota store reports the member fresh and non-blocking
+  (see [Store-driven reconciliation](#recovery-probing-for-parked-members)).
+  This matters for backends whose `429` reset overshoots the real quota
+  window (Z.ai's `unified-reset` runs hours past its dashboard 5-hour reset):
+  the live park no longer holds the pool in `429` until that stale reset. The
+  reconciliation is backend-agnostic and self-correcting — if a forwarded
+  request still genuinely `429`s, its blocking headers refresh the store and
+  the member re-parks.
 
 Each switch is logged server-side as one line — `auto[auto]: a -> b (a hit
 429)`, prefixed with the pool name — naming members only, never
@@ -1113,7 +1121,26 @@ store entry is stale — it does not reflect the upstream's recovery. Without
 operator action (`POST /_gateway/clear`), the member would stay parked for
 the full 5h.
 
-The recovery probe closes that gap. When every member of a pool is parked
+Two complementary mechanisms shorten that wait, split by whether the parked
+member's store entry is **fresh** or **stale**:
+
+**Store-driven reconciliation (fresh entry).** When the parked member is
+still being polled — the sole selectable member of its pool, or otherwise
+still the sticky one the poller refreshes — its store entry stays current.
+The gateway reconciles the live `429` park against that entry at read time
+(in the single live-park ∪ store union both routing and the pool UI consult):
+once a **fresh** snapshot (`as_of` within ~5 minutes) shows no blocking
+window, the live park is treated as stale and the member becomes selectable
+immediately, without waiting for the `429`'s own (possibly overshooting)
+reset. This is the fix for a backend whose `429` reset runs past its real
+quota window (issue #145: Z.ai's `unified-reset` ~2h52m past its dashboard
+5h reset). The freshness gate is load-bearing — an empty or frozen snapshot
+never un-parks a member; it falls back to wall-clock aging (below) or the
+recovery probe. The reconcile is non-destructive and self-correcting: if a
+forwarded request still genuinely `429`s, its blocking headers refresh the
+store and the member re-parks.
+
+**Recovery probe (stale entry).** When every member of a pool is parked
 (all-exhausted on the proxy path), the gateway re-probes each parked
 poller-tracked member through the same proprietary quota endpoint the
 poller uses (cheap, non-billable, returns utilization + precise reset). A
