@@ -328,6 +328,7 @@
     padding: 12px 16px;
   }
   .addsub-card h2 { margin: 0 0 10px; font-size: 15px; font-family: var(--mono); }
+  .addsub-hint { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
 
   form.add-member {
     display: flex;
@@ -810,15 +811,21 @@
     return el;
   }
 
+  // NEW_POOL is the sentinel pool-selector value that switches the form into
+  // create-a-runtime-pool mode (wires POST /_gateway/pool, issue #148).
+  var NEW_POOL = '__new__';
+
   // renderAddSubscription builds the single standalone Add-subscription form
   // (outside the pool boxes) into #addsub, rebuilt on each renderAll so the
-  // target-pool dropdown stays in sync. It targets any existing pool; "New
-  // pool" requires runtime pool creation (#104) and is intentionally absent.
+  // target-pool dropdown stays in sync. It targets any existing pool, and its
+  // "New pool…" selector option creates a runtime pool via POST /_gateway/pool
+  // (#104/#148) and can add the first member in the same submit. It renders
+  // even with zero pools so the first pool can be created from a fresh gateway.
   function renderAddSubscription(views) {
     var host = document.getElementById('addsub');
     if (!host) { return; }
     host.innerHTML = '';
-    if (!views || !views.length) { return; }
+    views = views || [];
 
     var section = document.createElement('section');
     section.className = 'addsub-card';
@@ -826,6 +833,13 @@
     var h2 = document.createElement('h2');
     h2.textContent = 'Add subscription';
     section.appendChild(h2);
+
+    var hint = document.createElement('p');
+    hint.className = 'addsub-hint';
+    hint.textContent = 'Choose a target pool, or pick "New pool…" to create a ' +
+      'runtime plain pool (name + base_url required) — a nick is optional there ' +
+      'and, if given, is added as the pool’s first member.';
+    section.appendChild(hint);
 
     var form = document.createElement('form');
     form.className = 'add-member';
@@ -835,6 +849,10 @@
     var base = mkInput('text', 'base_url', 'base_url (optional)');
     var cred = mkInput('password', 'credential', 'credential (optional)');
 
+    // New-pool fields, revealed only when NEW_POOL is selected.
+    var poolName = mkInput('text', 'pool_name', 'new pool name');
+    var poolBase = mkInput('text', 'pool_base_url', 'new pool base_url');
+
     var pool = document.createElement('select');
     pool.setAttribute('data-field', 'pool');
     views.forEach(function (v) {
@@ -843,11 +861,29 @@
       opt.textContent = v.pool;
       pool.appendChild(opt);
     });
+    var newOpt = document.createElement('option');
+    newOpt.value = NEW_POOL;
+    newOpt.textContent = 'New pool…';
+    pool.appendChild(newOpt);
 
     form.appendChild(nick);
     form.appendChild(base);
     form.appendChild(cred);
     form.appendChild(pool);
+    form.appendChild(poolName);
+    form.appendChild(poolBase);
+
+    // toggleNewPool reveals/hides the new-pool fields and adjusts the nick
+    // placeholder (nick is optional when creating a pool). Called on build and
+    // on every selector change so the zero-pool case starts already revealed.
+    function toggleNewPool() {
+      var creating = pool.value === NEW_POOL;
+      poolName.style.display = creating ? '' : 'none';
+      poolBase.style.display = creating ? '' : 'none';
+      nick.placeholder = creating ? 'nick (optional)' : 'nick';
+    }
+    pool.addEventListener('change', toggleNewPool);
+    toggleNewPool();
 
     var submit = document.createElement('button');
     submit.type = 'submit';
@@ -856,7 +892,10 @@
 
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
-      addSubscription({ nick: nick, base: base, cred: cred, pool: pool });
+      addSubscription({
+        nick: nick, base: base, cred: cred, pool: pool,
+        poolName: poolName, poolBase: poolBase,
+      });
     });
 
     section.appendChild(form);
@@ -989,6 +1028,47 @@
     var cred = fields.cred.value || '';
     var base = (fields.base.value || '').trim();
     var pool = fields.pool.value || '';
+
+    // "New pool…" mode: create the runtime pool first, then (optionally) add the
+    // first member into it. The pool is POSTed before any member, so a failed
+    // create leaves nothing partial behind. mode is omitted — the backend fixes
+    // it to "plain" (the only supported value).
+    if (pool === NEW_POOL) {
+      var pName = (fields.poolName.value || '').trim();
+      var pBase = (fields.poolBase.value || '').trim();
+      if (!pName) { showBanner('Create pool failed: pool name is required'); return; }
+      if (!pBase) { showBanner('Create pool failed: pool base_url is required'); return; }
+      postJSON('/_gateway/pool', { name: pName, base_url: pBase }).then(function (r) {
+        if (!r || !r.ok) {
+          // Surfaces 409 (duplicate name) / 400 (invalid input) via showBanner.
+          return refreshAfter(r, 'Failed to create pool');
+        }
+        // Use the server-normalized pool name as the member target.
+        var created = (r.body && r.body.pool) || pName;
+        fields.poolName.value = '';
+        fields.poolBase.value = '';
+        if (!nick) {
+          // Pool-only create: refresh so the new pool joins the list.
+          return refreshAfter(r, 'Failed to create pool');
+        }
+        // Add the first member into the fresh plain pool. A brand-new plain pool
+        // has no priority order, so no placement prompt is needed.
+        var mBody = {};
+        if (cred) { mBody['credential'] = cred; }
+        if (base) { mBody.base_url = base; }
+        return postJSON('/_gateway/pool/' + encodeURIComponent(created) +
+          '/member/' + encodeURIComponent(nick), mBody).then(function (r2) {
+          if (r2 && r2.ok) {
+            fields.nick.value = '';
+            fields.base.value = '';
+            fields.cred.value = '';
+          }
+          return refreshAfter(r2, 'Pool created but failed to add member');
+        });
+      });
+      return;
+    }
+
     // nick and a target pool are always required. The other two fields are
     // optional — the backend resolves them for a known subscription and returns
     // a clear 400 when it cannot.
