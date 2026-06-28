@@ -558,9 +558,9 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
   "pool": "auto",
   "active": "b",
   "members": [
-    { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "snapshot": { ... } },
-    { "nick": "b", "status": "active",    "exhausted_until": null,                   "snapshot": { ... } },
-    { "nick": "c", "status": "idle",      "exhausted_until": null,                   "snapshot": null }
+    { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "parked": true,  "snapshot": { ... } },
+    { "nick": "b", "status": "active",    "exhausted_until": null,                   "parked": false, "snapshot": { ... } },
+    { "nick": "c", "status": "idle",      "exhausted_until": null,                   "parked": false, "snapshot": null }
   ]
 }
 ```
@@ -577,6 +577,13 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 `null` otherwise. `snapshot` is the same `quota.Snapshot` object
 `/_gateway/quota` returns, or `null` when no snapshot has been recorded
 for that member yet.
+
+**`parked`** is `true` only when a **live-429 park** is currently holding the
+member out of rotation (present, reset not yet elapsed, and not reconciled away
+by a fresh healthy store snapshot). It is the precise gate for the per-nick
+"clear park" escape hatch — distinct from `status: "exhausted"`, which also
+covers store-driven exhaustion that clearing the live park cannot move. The UI
+shows the "Clear park" button only on a member with `parked: true`.
 
 **Caveat for Anthropic/Claude members:** the gateway never probes — quota
 state is learned only from real proxied responses. An idle or never-active
@@ -713,11 +720,42 @@ All error bodies are credential-free.
 > quota view. The Tailscale ACL restricting this port is the only gate; the
 > gateway adds no auth of its own.
 
+**Clearing live-429 parks.** `POST /_gateway/clear` drops reactive `429` parks
+so an over-parked member becomes selectable again without waiting out the park
+or restarting:
+
+| Query | Effect |
+|-------|--------|
+| _(none)_ | Clear every pool's live-429 parks |
+| `?pool=<name>` | Clear that one pool's live-429 parks |
+| `?pool=<name>&nick=<nick>` | Clear only `<nick>`'s live-429 park — the per-nick escape hatch for a single over-parked member, leaving the rest of the pool parked |
+
+```bash
+curl -X POST 'http://127.0.0.1:8080/_gateway/clear'                    # all pools
+curl -X POST 'http://127.0.0.1:8080/_gateway/clear?pool=auto'          # one pool
+curl -X POST 'http://127.0.0.1:8080/_gateway/clear?pool=auto&nick=a'   # one member
+```
+
+It clears **only the reactive 429 park** — store-sourced exhaustion (a window
+still at cap with a future reset) reflects polled reality and is left untouched.
+Clearing a member that is genuinely out of quota is harmless: it simply re-parks
+via the next upstream `429`. The per-nick form responds `{"pool","nick",
+"cleared":<bool>}` where `cleared` reports whether a live park was actually
+present; an unknown pool returns `404 {"error":"pool not found"}`, and a `nick`
+with no `pool` returns `400` rather than clearing every pool. This is the
+operator override complementary to the automatic recovery in
+[Recovery probing for parked members](#recovery-probing-for-parked-members):
+use it when the store itself is stale, poll lag holds a park through a recovery
+window, or you simply know the member is fine.
+
 A single-file management page is served at `GET /_gateway/ui`. Open it in a
 browser to view every pool, its priority order, the active member, and each
 member's live status (`active` / `exhausted` / `disabled` / `idle`), and to
-reorder priority or toggle enable/disable. It contains no auth and no build
-step — it inherits the gateway's trust boundary. In shared mode this exposes
+reorder priority, toggle enable/disable, or **clear a single member's live-429
+park**. The per-member "Clear park" button appears only on a member the gateway
+currently reports `parked: true`; clicking it confirms (it overrides the
+gateway's own judgment), clears that one nick, and re-fetches the view. It
+contains no auth and no build step — it inherits the gateway's trust boundary. In shared mode this exposes
 write controls to any tailnet member that can reach the port; a Tailscale
 ACL restricting the port is the only gate.
 

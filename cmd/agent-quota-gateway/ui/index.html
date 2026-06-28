@@ -306,6 +306,18 @@
     font-size: 12px;
   }
   button.move:hover { border-color: var(--accent); color: var(--accent); }
+  /* Per-member "Clear park" escape hatch (issue #147). Hidden by default; shown
+     by applyLiveStatus() only when the member reports parked:true. */
+  button.clear-park {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--accent);
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button.clear-park:hover { border-color: var(--accent); background: rgba(0, 0, 0, 0.04); }
 
   .addsub-card {
     background: var(--panel);
@@ -679,6 +691,20 @@
       });
       actions.appendChild(btn);
 
+      // "Clear park" — per-nick live-429 park override (issue #147). Created
+      // hidden; applyLiveStatus() reveals it only when /_gateway/pool reports
+      // this member parked:true (config carries no live park state).
+      var clr = document.createElement('button');
+      clr.type = 'button';
+      clr.className = 'clear-park';
+      clr.setAttribute('data-role', 'clear-park');
+      clr.textContent = 'Clear park';
+      clr.style.display = 'none';
+      clr.addEventListener('click', function () {
+        clearPark(view.pool, m.nick);
+      });
+      actions.appendChild(clr);
+
       var mv = document.createElement('button');
       mv.type = 'button';
       mv.className = 'move';
@@ -882,6 +908,13 @@
           badge.setAttribute('data-status', match.status || 'idle');
           badge.textContent = match.status || 'idle';
         }
+        // The per-nick "Clear park" control surfaces only on a live-parked
+        // member (issue #147). parked is the reliable live-429 gate from
+        // /_gateway/pool, independent of the status string.
+        var clr = tr.querySelector('[data-role="clear-park"]');
+        if (clr) {
+          clr.style.display = match.parked ? '' : 'none';
+        }
         var snap = match.snapshot || null;
         var cell5h = tr.querySelector('[data-role="quota-5h"]');
         if (cell5h) {
@@ -937,6 +970,18 @@
     var verb = disabled ? 'disable' : 'enable';
     postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick) + '/' + verb, null)
       .then(function (r) { return refreshAfter(r, 'Failed to ' + verb + ' member'); });
+  }
+
+  function clearPark(pool, nick) {
+    // This overrides the gateway's own judgment that the member is parked, so
+    // confirm. Real quota exhaustion re-parks via record429 on the next 429.
+    var ok = window.confirm(
+      'Clear the live-429 park on "' + nick + '" in pool "' + pool + '"?\n\n' +
+      'This forces the member back into rotation now, overriding the gateway. ' +
+      'If it is genuinely out of quota it will simply re-park on the next 429.');
+    if (!ok) { return; }
+    postJSON('/_gateway/clear?pool=' + encodeURIComponent(pool) + '&nick=' + encodeURIComponent(nick), null)
+      .then(function (r) { return refreshAfter(r, 'Failed to clear park'); });
   }
 
   function addSubscription(fields) {

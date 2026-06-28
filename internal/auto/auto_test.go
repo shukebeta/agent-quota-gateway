@@ -746,6 +746,105 @@ func TestController_ClearExhausted(t *testing.T) {
 	}
 }
 
+// TestController_ClearExhaustedNick verifies that the per-nick clear drops only
+// the named member's live-429 park, leaves the rest of the pool parked, and is
+// a harmless no-op for an unknown or un-parked nick (issue #147).
+func TestController_ClearExhaustedNick(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+
+	// Park b and c an hour out; a stays healthy.
+	reset := clock.now().Add(time.Hour)
+	c.record429("b", reset)
+	c.record429("c", reset)
+
+	// Clearing b reports a park was present and frees only b.
+	if cleared := c.ClearExhaustedNick("b"); !cleared {
+		t.Fatalf("ClearExhaustedNick(b) = false, want true (park was present)")
+	}
+	c.mu.Lock()
+	bExhausted := c.isExhaustedLocked("b")
+	cExhausted := c.isExhaustedLocked("c")
+	c.mu.Unlock()
+	if bExhausted {
+		t.Fatalf("after ClearExhaustedNick(b), b still exhausted, want healthy")
+	}
+	if !cExhausted {
+		t.Fatalf("after ClearExhaustedNick(b), c no longer exhausted, want c still parked")
+	}
+
+	// Clearing b again — now un-parked — is a no-op.
+	if again := c.ClearExhaustedNick("b"); again {
+		t.Fatalf("second ClearExhaustedNick(b) = true, want false (nothing to clear)")
+	}
+	// An unknown nick is a no-op too.
+	if unknown := c.ClearExhaustedNick("zzz"); unknown {
+		t.Fatalf("ClearExhaustedNick(zzz) = true, want false (unknown nick)")
+	}
+}
+
+// TestController_ClearExhaustedNick_storeUntouched verifies the "live-park only,
+// never store" contract: clearing a member that is BOTH live-parked and
+// store-exhausted drops the live park but leaves store-sourced exhaustion in
+// place, so the member stays exhausted. It also checks the Parked field gate:
+// true while the live park holds, false once cleared even though the member is
+// still store-exhausted (issue #147).
+func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+	c.store = store
+
+	// a is at cap with a future reset (store-exhausted) AND live-parked.
+	reset := clock.now().Add(time.Hour)
+	putSnap(store, c, "a", fptr(1.0), nil, tptr(reset), nil)
+	c.record429("a", reset)
+
+	if got := c.poolStatus(store); !memberParked(got, "a") {
+		t.Fatalf("before clear: a Parked=false, want true (live park active)")
+	}
+
+	if cleared := c.ClearExhaustedNick("a"); !cleared {
+		t.Fatalf("ClearExhaustedNick(a) = false, want true (live park was present)")
+	}
+
+	// Store exhaustion survives: a is still exhausted, and no longer Parked
+	// (the live park is gone; what remains is store-sourced).
+	c.mu.Lock()
+	aExhausted := c.isExhaustedLocked("a")
+	c.mu.Unlock()
+	if !aExhausted {
+		t.Fatalf("after ClearExhaustedNick(a), a healthy, want still store-exhausted")
+	}
+	got := c.poolStatus(store)
+	if memberParked(got, "a") {
+		t.Fatalf("after clear: a Parked=true, want false (only store exhaustion remains)")
+	}
+	if st := memberStatus(got, "a"); st != "exhausted" {
+		t.Fatalf("after clear: a status=%q, want exhausted (store-sourced)", st)
+	}
+}
+
+// memberParked returns the Parked flag for nick in a PoolStatus, or false.
+func memberParked(ps PoolStatus, nick string) bool {
+	for _, m := range ps.Members {
+		if m.Nick == nick {
+			return m.Parked
+		}
+	}
+	return false
+}
+
+// memberStatus returns the Status string for nick in a PoolStatus, or "".
+func memberStatus(ps PoolStatus, nick string) string {
+	for _, m := range ps.Members {
+		if m.Nick == nick {
+			return m.Status
+		}
+	}
+	return ""
+}
+
 // TestController_loadState_expiredExhaustedDropped verifies that an exhausted
 // entry whose reset is already in the past is dropped on load.
 func TestController_loadState_expiredExhaustedDropped(t *testing.T) {
@@ -1882,9 +1981,9 @@ func TestController_MarkLocalSnapshot_unknownNickIgnored(t *testing.T) {
 	c := newController(t, 0, clock, io.Discard, "a", "b")
 	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
 
-	pools.MarkLocalSnapshot("", "a")  // empty pool
-	pools.MarkLocalSnapshot("auto", "") // empty nick
-	pools.MarkLocalSnapshot("auto", "ghost") // not a member
+	pools.MarkLocalSnapshot("", "a")             // empty pool
+	pools.MarkLocalSnapshot("auto", "")          // empty nick
+	pools.MarkLocalSnapshot("auto", "ghost")     // not a member
 	pools.MarkLocalSnapshot("missing-pool", "a") // unknown pool
 
 	c.mu.Lock()

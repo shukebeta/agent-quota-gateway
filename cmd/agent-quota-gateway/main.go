@@ -415,8 +415,8 @@ func WindowLabelsFor(baseURL string) WindowLabels {
 // the human-facing label changes.
 type poolQuotaView struct {
 	quota.Snapshot
-	ActiveBackend string        `json:"active_backend"`
-	WindowLabels  WindowLabels  `json:"window_labels"`
+	ActiveBackend string       `json:"active_backend"`
+	WindowLabels  WindowLabels `json:"window_labels"`
 }
 
 // quotaHandler returns the JSON snapshot for the requested pool.
@@ -457,9 +457,11 @@ func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 // member wrongly marked exhausted (e.g. a transient/misconfigured 429 on an
 // account that still has quota) becomes selectable again without waiting out
 // the park or restarting the gateway. With ?pool=<name> it clears one pool;
-// without the param it clears every pool. Only the reactive 429 parks are
-// cleared — store-sourced exhaustion reflects polled reality and is left
-// alone. Non-POST returns 405.
+// without the param it clears every pool. With ?pool=<name>&nick=<nick> it
+// clears only that one member's park (issue #147) — the per-nick escape hatch
+// for an over-parked member when the rest of the pool should stay parked. Only
+// the reactive 429 parks are cleared — store-sourced exhaustion reflects polled
+// reality and is left alone. Non-POST returns 405.
 func clearHandler(pools *auto.Pools) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -469,6 +471,25 @@ func clearHandler(pools *auto.Pools) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		poolName := backend.NormalizeName(r.URL.Query().Get("pool"))
+		nick := backend.NormalizeName(r.URL.Query().Get("nick"))
+		// A nick is meaningless without the pool it lives in. Reject it
+		// explicitly BEFORE the pool-less all-pools branch below — otherwise
+		// ?nick=x with no pool would silently nuke every pool's parks.
+		if nick != "" {
+			if poolName == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "nick requires pool"})
+				return
+			}
+			cleared, ok := pools.ClearExhaustedNick(poolName, nick)
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"pool": poolName, "nick": nick, "cleared": cleared})
+			return
+		}
 		if poolName == "" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"cleared": pools.ClearAllExhausted()})
 			return
