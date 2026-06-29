@@ -135,6 +135,24 @@ func newController(t *testing.T, start int, clock *fixedClock, logOut io.Writer,
 	return NewController(testRegistry(t, nicks...), "auto", start, nil, clock.now, logOut)
 }
 
+// zaiController builds a single-pool controller whose pool default upstream
+// is a z.ai/Zhipu endpoint, so poller.ProviderFor recognises its members as
+// the z.ai provider (a pure URL match — no network). Used to drive the
+// z.ai-throttle path in ModifyResponse (issue #153).
+func zaiController(t *testing.T, clock *fixedClock, logOut io.Writer, nicks ...string) *Controller {
+	t.Helper()
+	scrubPoolEnv(t)
+	t.Setenv(backend.EnvPrefix+"AUTO_BASE_URL", "https://api.z.ai/api/anthropic")
+	for _, n := range nicks {
+		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
+	}
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	return NewController(reg, "auto", 0, nil, clock.now, logOut)
+}
+
 func (c *Controller) resolve(t *testing.T, nick string) backend.Backend {
 	t.Helper()
 	b, ok := c.reg.ResolveIn(c.pool, nick)
@@ -343,6 +361,61 @@ func TestModifyResponse_policy429NotParked(t *testing.T) {
 	// anthropic-ratelimit-* headers stripped.
 	if got := resp.Header.Get("anthropic-ratelimit-unified-status"); got != "" {
 		t.Errorf("anthropic-ratelimit header not stripped: %q", got)
+	}
+}
+
+// TestModifyResponse_zaiThrottleAbsorbed proves a z.ai/Zhipu proxy-path 429
+// (the 1302 concurrency throttle) is absorbed as a clean transient 503 with a
+// backoff Retry-After and never parks the member — issue #153. z.ai never
+// returns anthropic-ratelimit-* headers and genuine exhaustion is detected
+// out-of-band by the poller, so a proxy 429 is always a transient throttle,
+// even on the single-member pool that reproduced the agent-stopping bug.
+func TestModifyResponse_zaiThrottleAbsorbed(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := zaiController(t, clock, &logBuf, "ccz")
+
+	before := c.Current()
+	ctx := backend.WithBackend(context.Background(), c.resolve(t, "ccz"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	body := `{"error":{"code":"1302","message":"Rate limit reached for requests"}}`
+	resp := &http.Response{
+		StatusCode:    http.StatusTooManyRequests,
+		Header:        h,
+		Request:       req,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	// Rewritten to a clean transient 503 — not a terminal 429.
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503", resp.StatusCode)
+	}
+	// The upstream 1302 message must not leak to the client.
+	gotBody, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(gotBody), "1302") {
+		t.Errorf("503 body leaked the upstream 1302 message: %q", gotBody)
+	}
+	// Retry-After is the longer z.ai backoff, not the 1s switch default.
+	ra, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if ra < zaiThrottleRetryAfterSeconds {
+		t.Errorf("Retry-After=%d, want >= %d", ra, zaiThrottleRetryAfterSeconds)
+	}
+	// Member must NOT be parked: sticky pointer unchanged, pool not exhausted.
+	if got := c.Current(); got != before {
+		t.Errorf("Current()=%q, want %q (z.ai throttle must not park/failover)", got, before)
+	}
+	if _, _, exhausted := c.ResolveAuto(); exhausted {
+		t.Errorf("ResolveAuto exhausted=true after z.ai throttle, want false (not parked)")
+	}
+	if log := logBuf.String(); !strings.Contains(log, "z.ai 429 concurrency throttle") {
+		t.Errorf("z.ai throttle not logged; got %q", log)
 	}
 }
 
