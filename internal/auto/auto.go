@@ -81,6 +81,14 @@ const storeSnapshotFreshness = 5 * time.Minute
 // immediately and rebuild its cache on the new backend.
 const switchRetryAfterSeconds = 1
 
+// zaiThrottleRetryAfterSeconds is the Retry-After a z.ai/Zhipu concurrency
+// throttle (the 1302 "Rate limit reached for requests" 429) is absorbed
+// into. It is longer than switchRetryAfterSeconds so a single-member z.ai
+// pool's retry gives the GLM concurrency window (often capped at 1) time
+// to free up instead of immediately re-hitting the throttle, while still
+// being short enough for a transparent client retry (issue #153).
+const zaiThrottleRetryAfterSeconds = 3
+
 // window5h is the length of the Anthropic unified short window, used by
 // the lead calculation:
 //
@@ -2110,6 +2118,21 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
+		// A z.ai/Zhipu proxy-path 429 is always a transient concurrency
+		// throttle (the 1302 "Rate limit reached for requests"), never a
+		// genuine-exhaustion signal — for z.ai that is detected out-of-band
+		// by the poller, never by a proxy 429. Absorb it as the gateway's
+		// clean transient 503 + a short backoff so the client retries
+		// transparently; never park the member, and never let the upstream
+		// 1302 body reach the agent (issue #153). Keyed before the
+		// exhaustion classifier so a momentarily at-cap store snapshot can't
+		// misclassify the 1302 as genuine exhaustion and over-park.
+		if isZaiBackend(b) {
+			fmt.Fprintf(c.logOut, "auto[%s]: %s z.ai 429 concurrency throttle — absorbing as transient, not parking\n", c.pool, b.Nick)
+			rewriteTo503(resp)
+			setRetryAfter(resp.Header, zaiThrottleRetryAfterSeconds)
+			return nil
+		}
 		respSnap := quota.Extract(resp)
 		if !c.isGenuineExhaustionSignal(b.Nick, respSnap) {
 			fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.pool, b.Nick)
@@ -2134,6 +2157,19 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 // 429's recoverable quota exhaustion.
 func isCredentialRejected(code int) bool {
 	return code == http.StatusUnauthorized || code == http.StatusForbidden
+}
+
+// isZaiBackend reports whether b is a z.ai/Zhipu backend. For these
+// backends a proxy-path 429 is always a transient concurrency/QPS throttle
+// (the 1302 "Rate limit reached for requests"): genuine quota exhaustion is
+// detected out-of-band by the poller (5h / monthly windows via the quota
+// endpoint), never by a proxy 429. So a z.ai proxy 429 is never a
+// park-worthy exhaustion signal (issue #153). Detection reuses the same
+// URL-keyed provider registry as poolWindowLabelsFor; ProviderFor is a pure
+// match with no network call.
+func isZaiBackend(b backend.Backend) bool {
+	prov, ok := poller.ProviderFor(b.BaseURL)
+	return ok && prov.Name() == "z.ai/zhipu"
 }
 
 // parkAndFailover parks nick until reset, advances the sticky pointer, and

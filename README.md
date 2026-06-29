@@ -504,6 +504,16 @@ its own body:
   reconciliation is backend-agnostic and self-correcting — if a forwarded
   request still genuinely `429`s, its blocking headers refresh the store and
   the member re-parks.
+- **A z.ai/Zhipu member `429`s →** this is always a transient concurrency
+  throttle (z.ai's `1302` "Rate limit reached for requests", emitted when the
+  GLM Coding Plan concurrency cap — often as low as 1 — is hit), never quota
+  exhaustion: z.ai exhaustion is tracked out-of-band by the poller (5h /
+  monthly windows), never signalled by a proxy `429`. The gateway absorbs it
+  as a clean `503` with a short backoff `Retry-After` (a few seconds, longer
+  than the 1 s switch hint so a single-member pool's retry lets the
+  concurrency window free up), leaves the member in rotation, and never lets
+  the upstream `1302` message reach the client. Claude Code retries the `503`
+  transparently instead of stopping on the passed-through `429`.
 
 Each switch is logged server-side as one line — `auto[auto]: a -> b (a hit
 429)`, prefixed with the pool name — naming members only, never
