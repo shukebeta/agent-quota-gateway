@@ -598,16 +598,18 @@
     var table = document.createElement('table');
     table.className = 'members';
 
-    // Per-pool column labels (issue #138): the long-window column header
-    // is provider-aware. Z.AI's long window is monthly, not 7-day, so
-    // the column must say so. Default is the Anthropic-style "7d".
-    var labels = (view && view.window_labels) ? view.window_labels : { short: '5h', long: '7d' };
-    var longLabel = labels.long || '7d';
-    var longResetLabel = longLabel + ' reset';
-
+    // Provider-agnostic column headers (issue #154): the long-window
+    // header used to be inferred from the active member's base URL via
+    // view.window_labels.long (issue #138), so it flipped across failover
+    // (z.ai monthly <-> Anthropic 7d) and had no single correct value for
+    // a mixed pool — while the cell data always lives in unified_7d_*
+    // regardless. A pool name carries no window semantics, so the header
+    // is now a fixed string. The provider switch still drives lead-routing
+    // math (poller.LongWindowFor, issue #140); only this UI label dropped
+    // its dependency on it. CSS text-transform:uppercase renders these.
     var thead = document.createElement('thead');
     var trh = document.createElement('tr');
-    ['Nick', 'Status', '5h', '5h reset', longLabel, longResetLabel, ''].forEach(function (h) {
+    ['Nick', 'Status', '5 Hour', '5 Hour reset', 'Weekly/Monthly', 'Weekly/Monthly reset', ''].forEach(function (h) {
       var th = document.createElement('th');
       th.textContent = h;
       trh.appendChild(th);
