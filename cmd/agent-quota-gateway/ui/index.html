@@ -690,7 +690,12 @@
       labelEl.textContent = m.disabled ? 'Off' : 'On';
       btn.appendChild(labelEl);
       btn.addEventListener('click', function () {
-        toggleMember(view.pool, m.nick, !m.disabled);
+        // Read the current state from the live data-state (applyLiveStatus keeps
+        // it in sync with /_gateway/pool), not the render-time m.disabled closure.
+        // Once an out-of-band disable has diverged badge from toggle, the captured
+        // value is stale and would issue the wrong verb (issue #159).
+        var enabled = btn.getAttribute('data-state') === 'enabled';
+        toggleMember(view.pool, m.nick, enabled);
       });
       actions.appendChild(btn);
 
@@ -948,6 +953,18 @@
         if (badge) {
           badge.setAttribute('data-status', match.status || 'idle');
           badge.textContent = match.status || 'idle';
+        }
+        // Sync the toggle from the live disabled flag so it can't freeze "On"
+        // while the badge reads "disabled" after an out-of-band disable (issue
+        // #159). Mirrors the render-time logic at the toggle's creation.
+        var toggle = tr.querySelector('[data-role="toggle"]');
+        if (toggle) {
+          var disabled = !!match.disabled;
+          toggle.setAttribute('data-state', disabled ? 'disabled' : 'enabled');
+          toggle.setAttribute('aria-checked', disabled ? 'false' : 'true');
+          toggle.setAttribute('aria-label', disabled ? 'Enable member' : 'Disable member');
+          var tl = toggle.querySelector('.toggle-label');
+          if (tl) tl.textContent = disabled ? 'Off' : 'On';
         }
         // The per-nick "Clear park" control surfaces only on a live-parked
         // member (issue #147). parked is the reliable live-429 gate from
