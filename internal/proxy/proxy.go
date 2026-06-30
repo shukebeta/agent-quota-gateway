@@ -96,7 +96,17 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 		r.URL.Scheme = upstream.Scheme
 		r.URL.Host = upstream.Host
 		r.Host = upstream.Host
-		r.URL.Path = joinPath(strings.TrimRight(upstream.Path, "/"), r.URL.Path)
+		basePath := strings.TrimRight(upstream.Path, "/")
+		reqPath := r.URL.Path
+		// Only root-mounted upstreams (the native Anthropic surface and
+		// every root-mounted Anthropic-compat vendor) get the /v1 prefix
+		// normalized. An upstream whose base URL carries its own path
+		// prefix owns its routing convention, so we leave its paths
+		// untouched (issue #157).
+		if basePath == "" {
+			reqPath = normalizeLeadingV1(reqPath)
+		}
+		r.URL.Path = joinPath(basePath, reqPath)
 
 		stampAuth(r.Header, b.Credential)
 	}
@@ -190,6 +200,42 @@ func joinPath(basePath, requestPath string) string {
 	default:
 		return base + "/" + req
 	}
+}
+
+// normalizeLeadingV1 rewrites an inbound request path so it carries
+// exactly one leading "/v1" segment. It runs only for root-mounted
+// upstreams — the native Anthropic surface and every root-mounted
+// Anthropic-compat vendor (Z.ai, MiniMax, Volcengine, …), all of which
+// serve the V1 API from the host root.
+//
+// Clients disagree on who owns the "/v1" prefix when a reverse proxy
+// sits in front of an API that already lives at /v1/*:
+//   - Claude Code points its base URL at the gateway root and sends
+//     /v1/messages (untouched here);
+//   - OpenCode / Codex and SDKs that hardcode baseURL/v1 require the
+//     operator to set the base URL with a /v1 suffix, so the prefix is
+//     consumed there and the request arrives as /messages;
+//   - a few SDKs add their own /v1 on top, producing /v1/v1/messages.
+//
+// Collapsing any run of leading /v1 segments to one — and prepending
+// /v1 when none is present — makes all three reach the upstream's /v1
+// surface (issue #157). The match is segment-aware: "/v1" counts only
+// when followed by "/" or end-of-path, so "/v1beta/x" is a bare subpath
+// (→ /v1/v1beta/x), not a version segment to collapse.
+func normalizeLeadingV1(path string) string {
+	rest := path
+	for {
+		if rest == "/v1" {
+			rest = ""
+			break
+		}
+		if strings.HasPrefix(rest, "/v1/") {
+			rest = rest[len("/v1"):]
+			continue
+		}
+		break
+	}
+	return "/v1" + rest
 }
 
 // oauthBeta is the anthropic-beta opt-in Anthropic requires for OAuth

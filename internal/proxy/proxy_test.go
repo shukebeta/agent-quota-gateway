@@ -313,6 +313,67 @@ func TestProxy_perBackendBaseURLAndPathPrefix(t *testing.T) {
 	}
 }
 
+// TestProxy_normalizeLeadingV1 covers the /v1 prefix normalization
+// (issue #157): for root-mounted upstreams the inbound path is rewritten
+// to carry exactly one leading /v1 segment, while a non-root upstream
+// (base URL with its own path prefix) is left untouched. The cases mirror
+// the issue's table.
+func TestProxy_normalizeLeadingV1(t *testing.T) {
+	cases := []struct {
+		name     string
+		basePath string // appended to the fake upstream URL; "" = root-mounted
+		inbound  string
+		want     string
+	}{
+		// 1. Claude Code's working path is untouched (regression guard).
+		{"native_single_v1", "", "/v1/messages", "/v1/messages"},
+		// 2-3. SDKs that double / triple the prefix collapse to one.
+		{"native_double_v1", "", "/v1/v1/messages", "/v1/messages"},
+		{"native_triple_v1", "", "/v1/v1/v1/messages", "/v1/messages"},
+		// 4. OpenCode / Codex consume /v1 from the base URL → gains it back.
+		{"native_bare_messages", "", "/messages", "/v1/messages"},
+		// 5. A bare subpath gains the prefix.
+		{"native_bare_subpath", "", "/some/random/path", "/v1/some/random/path"},
+		// 6. Only the duplicate prefix collapses; the suffix passes through.
+		{"native_double_v1_subpath", "", "/v1/v1/some/other/path", "/v1/some/other/path"},
+		// 8. A root-mounted Anthropic-compat vendor (not native) gets the
+		// same fix — locks in the wide scope.
+		{"compat_root_bare_messages", "", "/messages", "/v1/messages"},
+		// 7. Non-root upstream: the operator's base path is preserved and
+		// no /v1 rule fires — behaviour identical to today.
+		{"non_root_unchanged", "/anthropic", "/v1/messages", "/anthropic/v1/messages"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+			})
+			upSrv := httptest.NewServer(upstream)
+			t.Cleanup(upSrv.Close)
+
+			gw, err := proxy.New(nil, nil)
+			if err != nil {
+				t.Fatalf("proxy.New: %v", err)
+			}
+			b := backend.Backend{Pool: "p", Nick: "n", Credential: testAPIKey, BaseURL: upSrv.URL + tc.basePath}
+			gwSrv := httptest.NewServer(injectBackend(b, gw))
+			t.Cleanup(gwSrv.Close)
+
+			resp, err := http.Post(gwSrv.URL+tc.inbound, "application/json", strings.NewReader("{}"))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			resp.Body.Close()
+
+			if gotPath != tc.want {
+				t.Errorf("upstream saw path %q, want %q", gotPath, tc.want)
+			}
+		})
+	}
+}
+
 // TestProxy_nonPOSTMethodReachesUpstream confirms the proxy forwards
 // non-POST methods (the POST-only gate was lifted in #141): a GET with a
 // valid selector reaches the upstream, carrying the backend's stamped
