@@ -640,6 +640,94 @@ func TestPoller_marksLocalSnapshot(t *testing.T) {
 	}
 }
 
+// TestPoller_partialPollPreservesPriorSnapshot is the #167 writer-layer
+// regression for #163: a poll that returns only one window (here TOKENS_LIMIT,
+// the short/5h slot, with no TIME_LIMIT) must update that window while leaving
+// the previously-learned long-window (7d/monthly) reset intact. This drives
+// the real Run/pollAll path — if pollAll reverts p.store.Merge to
+// p.store.Put, the seeded 7d reset blanks and this test fails. The Store-level
+// tests in internal/quota only cover Store.Merge in isolation.
+func TestPoller_partialPollPreservesPriorSnapshot(t *testing.T) {
+	// Poll response carries ONLY TOKENS_LIMIT (5h), no TIME_LIMIT (7d).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":7,"nextResetTime":1781418024826}]}}`)
+	}))
+	defer srv.Close()
+
+	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
+	store := quota.NewStore()
+
+	// Seed both windows under the nick's quota key, as a full earlier poll
+	// would have. The 7d reset is the field that must survive the partial poll.
+	priorReset5h := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	reset7d := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	util7d := 0.16
+	store.Put(b.QuotaKey(), quota.Snapshot{
+		Unified5hReset:       &priorReset5h,
+		Unified7dReset:       &reset7d,
+		Unified7dUtilization: &util7d,
+		AsOf:                 fixedNow,
+	})
+
+	// markLocal runs after the merge (see TestPoller_marksLocalSnapshot), so
+	// it is a reliable signal that the poll has landed in the store.
+	var (
+		mu     sync.Mutex
+		polled bool
+	)
+	markLocal := func(poolName, nick string) {
+		mu.Lock()
+		defer mu.Unlock()
+		polled = true
+	}
+
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), markLocal, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		ok := polled
+		mu.Unlock()
+		if ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("poll did not land within deadline")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancel")
+	}
+
+	got := store.Get(b.QuotaKey())
+	// Present window updated to the polled reset.
+	wantReset5h := msToTime(1781418024826)
+	if got.Unified5hReset == nil || !got.Unified5hReset.Equal(*wantReset5h) {
+		t.Errorf("after partial poll, Unified5hReset = %v, want %v (polled window must update)", got.Unified5hReset, wantReset5h)
+	}
+	// Absent window's learned reset must survive.
+	if got.Unified7dReset == nil || !got.Unified7dReset.Equal(reset7d) {
+		t.Errorf("after partial poll, Unified7dReset = %v, want %v (absent window's learned reset must survive)", got.Unified7dReset, reset7d)
+	}
+	if got.Unified7dUtilization == nil || *got.Unified7dUtilization != util7d {
+		t.Errorf("after partial poll, Unified7dUtilization = %v, want %v (absent window's utilization must survive)", got.Unified7dUtilization, util7d)
+	}
+}
+
 // withTestProvider appends a provider that matches a literal host fragment
 // (the httptest server URL) and restores the registry when the test ends.
 // httptest hosts are 127.0.0.1:port, which no real provider matcher would

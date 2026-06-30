@@ -1156,6 +1156,43 @@ func TestObserver_orgIDOnlyResponseDoesNotErasePriorSnapshot(t *testing.T) {
 	}
 }
 
+// TestObserver_partialResponsePreservesPriorSnapshot is the #167 writer-layer
+// regression for #163: a response that carries ONLY the 5h reset must update
+// the 5h field while leaving the previously-learned 7d reset intact. This
+// pins the Merge (not Put) substitution in the observer path — if runObserver
+// reverts to store.Put, the 7d reset blanks and this test fails. The
+// Store-level tests in internal/quota only cover Store.Merge in isolation;
+// this exercises the live observer closure's use of it.
+func TestObserver_partialResponsePreservesPriorSnapshot(t *testing.T) {
+	store := quota.NewStore()
+	observer := runObserver(store)
+
+	// Seed both windows, as a full earlier response would have. With no
+	// backend on the request context the observer files under
+	// defaultBackendKey, so seed and read under that same key.
+	priorReset5h := time.Unix(1_700_000_000+3600, 0).UTC()
+	reset7d := time.Unix(1_700_000_000+7*24*3600, 0).UTC()
+	store.Put(defaultBackendKey, quota.Snapshot{
+		Unified5hReset: &priorReset5h,
+		Unified7dReset: &reset7d,
+		AsOf:           time.Unix(1_700_000_000, 0).UTC(),
+	})
+
+	// A response carrying only the 5h reset (no 7d header at all).
+	newReset5h := time.Unix(1_700_000_000+2*3600, 0).UTC()
+	observer(mkRespWithHeaders(map[string]string{
+		"anthropic-ratelimit-unified-5h-reset": strconv.FormatInt(newReset5h.Unix(), 10),
+	}))
+
+	got := store.Get(defaultBackendKey)
+	if got.Unified5hReset == nil || !got.Unified5hReset.Equal(newReset5h) {
+		t.Errorf("after partial 5h response, store.Unified5hReset = %v, want %v (present window must update)", got.Unified5hReset, newReset5h)
+	}
+	if got.Unified7dReset == nil || !got.Unified7dReset.Equal(reset7d) {
+		t.Errorf("after partial 5h response, store.Unified7dReset = %v, want %v (absent window's learned reset must survive)", got.Unified7dReset, reset7d)
+	}
+}
+
 // TestObserver_5hResponseUpdatesSnapshot proves the gate does not over-fire:
 // a response that carries the 5h reset must still update the snapshot.
 // (Without a backend on the request context, the observer files under
