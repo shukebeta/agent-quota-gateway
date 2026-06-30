@@ -111,6 +111,15 @@ ANTHROPIC_AUTH_TOKEN=auto \
 claude
 ```
 
+The gateway normalizes the leading `/v1` on the request path, so the
+client base URL works either way: set it to the gateway root
+(`http://127.0.0.1:8080`, what Claude Code uses) **or** with a `/v1`
+suffix (`http://127.0.0.1:8080/v1`, what OpenCode / Codex and SDKs that
+hardcode `baseURL/v1` require). Both reach the upstream's `/v1` surface
+correctly. (This applies to every pool whose upstream is mounted at the
+host root, including Anthropic-compat vendors; a pool whose base URL
+carries its own path prefix is left untouched.)
+
 The pool name replaces what used to be a real token — the consumer side
 changes only its *value*, not its wiring. Pool and member names are
 normalized: `AQG_POOL_AUTO_BACKEND_A` declares pool `auto`, member `a`
