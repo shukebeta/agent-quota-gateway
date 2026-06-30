@@ -1705,6 +1705,40 @@ func TestRuntimeConfig_disabledMemberRemoval(t *testing.T) {
 	}
 }
 
+// TestController_poolStatus_disabledField proves MemberStatus.Disabled mirrors
+// c.disabled[nick] exactly — true precisely for the member whose status string
+// is "disabled" — so the UI toggle and the badge read from one source and can
+// never diverge (issue #159).
+func TestController_poolStatus_disabledField(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+
+	// Baseline: nobody disabled.
+	for _, m := range c.poolStatus(store).Members {
+		if m.Disabled {
+			t.Fatalf("before disable: %q Disabled=true, want false", m.Nick)
+		}
+	}
+
+	// Disable b.
+	c.mu.Lock()
+	c.setDisabledLocked("b", true)
+	c.mu.Unlock()
+
+	got := c.poolStatus(store)
+	for _, m := range got.Members {
+		wantDisabled := m.Nick == "b"
+		if m.Disabled != wantDisabled {
+			t.Fatalf("%q Disabled=%v, want %v", m.Nick, m.Disabled, wantDisabled)
+		}
+		// Disabled must agree with the status string: true exactly when "disabled".
+		if (m.Status == "disabled") != m.Disabled {
+			t.Fatalf("%q Disabled=%v but status=%q — fields disagree", m.Nick, m.Disabled, m.Status)
+		}
+	}
+}
+
 // TestRuntimeConfig_allDisabledYieldsExhausted proves that when every
 // member is disabled, ResolveAuto returns exhausted=true (same as all-exhausted).
 func TestRuntimeConfig_allDisabledYieldsExhausted(t *testing.T) {

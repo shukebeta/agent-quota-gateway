@@ -260,9 +260,17 @@ func (p *Pools) ClearAllExhausted() map[string][]string {
 // MemberStatus describes one pool member's current state for /_gateway/pool.
 type MemberStatus struct {
 	Nick           string          `json:"nick"`
-	Status         string          `json:"status"`          // "active", "exhausted", "idle"
+	Status         string          `json:"status"`          // "active", "exhausted", "idle", "disabled"
 	ExhaustedUntil *time.Time      `json:"exhausted_until"` // RFC 3339 or null
 	Snapshot       *quota.Snapshot `json:"snapshot"`        // null when no snapshot recorded
+
+	// Disabled mirrors c.disabled[nick] — the same source the "disabled"
+	// status string derives from, so the two can never disagree. The UI's
+	// per-member toggle reads this on every /_gateway/pool poll to stay in
+	// sync with an out-of-band disable (second tab, API, another operator);
+	// without it the live overlay had no data to sync the switch from and it
+	// froze at the last full config render while the badge moved (issue #159).
+	Disabled bool `json:"disabled"`
 
 	// Parked reports whether a live-429 park is currently holding this member
 	// out of rotation — present, reset still in the future, and not reconciled
@@ -1684,7 +1692,7 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 	effective := c.addedMembersLocked()
 	members := make([]MemberStatus, 0, len(effective))
 	for _, nick := range effective {
-		ms := MemberStatus{Nick: nick}
+		ms := MemberStatus{Nick: nick, Disabled: c.disabled[nick]}
 		// exhausted is checked before the sticky (curNick) arm: "active" must
 		// mean the sticky member that is ALSO currently available. A sticky
 		// member that is parked is treated as unavailable by the routing path
