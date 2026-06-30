@@ -578,9 +578,10 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
   "pool": "auto",
   "active": "b",
   "members": [
-    { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "parked": true,  "snapshot": { ... } },
-    { "nick": "b", "status": "active",    "exhausted_until": null,                   "parked": false, "snapshot": { ... } },
-    { "nick": "c", "status": "idle",      "exhausted_until": null,                   "parked": false, "snapshot": null }
+    { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "snapshot": { ... }, "disabled": false, "parked": true  },
+    { "nick": "b", "status": "active",    "exhausted_until": null,                   "snapshot": { ... }, "disabled": false, "parked": false },
+    { "nick": "c", "status": "idle",      "exhausted_until": null,                   "snapshot": null,    "disabled": false, "parked": false },
+    { "nick": "d", "status": "disabled",  "exhausted_until": null,                   "snapshot": null,    "disabled": true,  "parked": false }
   ]
 }
 ```
@@ -592,6 +593,7 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 | `active` | Currently selected by the sticky pointer **and** available — `exhausted` outranks `active`, so a sticky member that is also parked reports `exhausted`, not `active` |
 | `exhausted` | Parked — either a live-429 park or store-driven exhaustion; `exhausted_until` is the reset time |
 | `idle` | Healthy and not currently active |
+| `disabled` | Taken out of selection and failover by the runtime disable toggle — `disabled` outranks every other state, so a disabled member always reports `disabled` regardless of its quota |
 
 `exhausted_until` is an RFC 3339 timestamp when `status == "exhausted"`,
 `null` otherwise. `snapshot` is the same `quota.Snapshot` object
@@ -604,6 +606,13 @@ by a fresh healthy store snapshot). It is the precise gate for the per-nick
 "clear park" escape hatch — distinct from `status: "exhausted"`, which also
 covers store-driven exhaustion that clearing the live park cannot move. The UI
 shows the "Clear park" button only on a member with `parked: true`.
+
+**`disabled`** is `true` when the member has been taken out of selection and
+failover by the runtime disable toggle (`POST
+/_gateway/pool/{name}/member/{nick}/disable`, see below) — the same source
+the `status: "disabled"` string derives from, so the two can never disagree.
+The UI's per-member toggle reads this on every poll to stay in sync with an
+out-of-band disable (another tab, the API, another operator).
 
 **Caveat for Anthropic/Claude members:** the gateway never probes — quota
 state is learned only from real proxied responses. An idle or never-active
