@@ -83,7 +83,8 @@ Out of scope:
 - TLS termination (front it with a reverse proxy or `stunnel` if needed).
 - Request/response body modification, caching, retries.
 - Quota history or per-request metering — only the latest snapshot per
-  backend is kept.
+  backend is kept. Snapshots are merged field-by-field, so a window absent
+  from one response/poll no longer clears a reset already learned.
 - Authentication on `/_gateway/*` — loopback is the trust boundary (in
   [shared mode](#shared-mode-over-tailscale) the Tailscale ACL is, and the
   `/_gateway/quota` view becomes readable by every permitted tailnet

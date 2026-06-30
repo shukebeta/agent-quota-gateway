@@ -178,6 +178,87 @@ func (s *Store) Put(key string, snap Snapshot) {
 	}
 }
 
+// Merge records snap under key, but preserves any previously-cached field
+// that snap does not carry. For every field that distinguishes "absent"
+// from a real zero — nil *float64, nil *time.Time, empty string — a nil/
+// empty value on snap retains the prior snapshot's value; only fields
+// actually present on snap overwrite. Backend (forced to key) and AsOf
+// always come from snap.
+//
+// This is the write path for the two live writers (the response observer
+// and the poller). A given upstream response or poll reports only the
+// windows it touched, so partial snapshots are normal; a wholesale Put
+// would blank the reset/utilization fields the missing windows had taught
+// us, flashing the UI reset cells to "-" until a complete response landed
+// (issue #163). Merge keeps those fields. The hasQuotaWindow / HasData
+// gates upstream of this call still skip a fully-empty response, so a
+// no-window response neither bumps AsOf nor overwrites anything (the #121
+// org-id-only guard is unaffected).
+//
+// A stale-but-preserved reset is safe for the routing logic: windowBlocks
+// and the lead computation both gate on the reset still being in the
+// future, so a past reset reads as not-blocking exactly as a nil one did.
+func (s *Store) Merge(key string, snap Snapshot) {
+	snap.Backend = key
+	s.mu.Lock()
+	if prev, ok := s.data[key]; ok {
+		snap = mergeSnapshot(prev, snap)
+	}
+	s.data[key] = snap
+	onChange := s.onChange
+	s.mu.Unlock()
+	if onChange != nil {
+		onChange()
+	}
+}
+
+// mergeSnapshot returns next with every absent field (nil pointer or empty
+// string) filled from prev. Backend and AsOf are always next's — the merge
+// preserves learned window data, not the "when we last heard" timestamp.
+func mergeSnapshot(prev, next Snapshot) Snapshot {
+	out := next
+	if out.UnifiedStatus == "" {
+		out.UnifiedStatus = prev.UnifiedStatus
+	}
+	if out.UnifiedReset == nil {
+		out.UnifiedReset = prev.UnifiedReset
+	}
+	if out.UnifiedRepresentativeClaim == "" {
+		out.UnifiedRepresentativeClaim = prev.UnifiedRepresentativeClaim
+	}
+	if out.Unified5hStatus == "" {
+		out.Unified5hStatus = prev.Unified5hStatus
+	}
+	if out.Unified5hUtilization == nil {
+		out.Unified5hUtilization = prev.Unified5hUtilization
+	}
+	if out.Unified5hReset == nil {
+		out.Unified5hReset = prev.Unified5hReset
+	}
+	if out.Unified7dStatus == "" {
+		out.Unified7dStatus = prev.Unified7dStatus
+	}
+	if out.Unified7dUtilization == nil {
+		out.Unified7dUtilization = prev.Unified7dUtilization
+	}
+	if out.Unified7dReset == nil {
+		out.Unified7dReset = prev.Unified7dReset
+	}
+	if out.UnifiedFallbackPercentage == nil {
+		out.UnifiedFallbackPercentage = prev.UnifiedFallbackPercentage
+	}
+	if out.UnifiedOverageStatus == "" {
+		out.UnifiedOverageStatus = prev.UnifiedOverageStatus
+	}
+	if out.UnifiedOverageDisabledReason == "" {
+		out.UnifiedOverageDisabledReason = prev.UnifiedOverageDisabledReason
+	}
+	if out.OrgID == "" {
+		out.OrgID = prev.OrgID
+	}
+	return out
+}
+
 // Get returns the snapshot recorded for key. When no snapshot has been
 // recorded, Get returns an empty Snapshot with Backend=key and a fresh
 // AsOf timestamp so consumers always see a parseable JSON object.

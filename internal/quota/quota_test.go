@@ -212,6 +212,74 @@ func TestStore_putGetBackendKeyEnforced(t *testing.T) {
 	}
 }
 
+func TestStore_MergePreservesAbsentFields(t *testing.T) {
+	st := NewStore()
+
+	// Seed a complete snapshot: both window resets and a 5h utilization.
+	reset5h := time.Unix(1_700_000_000+3600, 0).UTC()
+	reset7d := time.Unix(1_700_000_000+7*24*3600, 0).UTC()
+	util5h := 0.42
+	st.Merge("ccz", Snapshot{
+		Unified5hReset:       &reset5h,
+		Unified7dReset:       &reset7d,
+		Unified5hUtilization: &util5h,
+		AsOf:                 time.Unix(1_700_000_000, 0).UTC(),
+	})
+
+	// A partial poll: carries a fresh 5h utilization but omits the 7d window
+	// entirely (the z.ai "no TIME_LIMIT this cycle" shape). The 7d reset must
+	// survive; the 5h utilization must update.
+	newUtil5h := 0.55
+	st.Merge("ccz", Snapshot{
+		Unified5hUtilization: &newUtil5h,
+		AsOf:                 time.Unix(1_700_000_120, 0).UTC(),
+	})
+
+	got := st.Get("ccz")
+	if got.Unified7dReset == nil || !got.Unified7dReset.Equal(reset7d) {
+		t.Errorf("Unified7dReset = %v, want %v (absent window must be preserved)", got.Unified7dReset, reset7d)
+	}
+	if got.Unified5hReset == nil || !got.Unified5hReset.Equal(reset5h) {
+		t.Errorf("Unified5hReset = %v, want %v (absent field must be preserved)", got.Unified5hReset, reset5h)
+	}
+	if got.Unified5hUtilization == nil || *got.Unified5hUtilization != newUtil5h {
+		t.Errorf("Unified5hUtilization = %v, want %v (present field must update)", got.Unified5hUtilization, newUtil5h)
+	}
+	// Backend is forced to the key; AsOf always comes from the newest write.
+	if got.Backend != "ccz" {
+		t.Errorf("Backend = %q, want ccz", got.Backend)
+	}
+	if !got.AsOf.Equal(time.Unix(1_700_000_120, 0).UTC()) {
+		t.Errorf("AsOf = %v, want the newest write's timestamp", got.AsOf)
+	}
+}
+
+func TestStore_MergeIntoEmptyEqualsPut(t *testing.T) {
+	// Merge into an absent key has no prior to merge under, so it must behave
+	// exactly like Put — this is the restore/migration equivalence the two
+	// methods rely on.
+	util := 0.25
+	reset := time.Unix(1_700_000_000, 0).UTC()
+	snap := Snapshot{Unified5hUtilization: &util, Unified5hReset: &reset, AsOf: time.Unix(1, 0).UTC()}
+
+	merged := NewStore()
+	merged.Merge("k", snap)
+	put := NewStore()
+	put.Put("k", snap)
+
+	gm, gp := merged.Get("k"), put.Get("k")
+	if gm.Backend != "k" || gp.Backend != "k" {
+		t.Errorf("Backend not stamped: merge=%q put=%q", gm.Backend, gp.Backend)
+	}
+	if gm.Unified5hUtilization == nil || gp.Unified5hUtilization == nil ||
+		*gm.Unified5hUtilization != *gp.Unified5hUtilization {
+		t.Errorf("Unified5hUtilization differs: merge=%v put=%v", gm.Unified5hUtilization, gp.Unified5hUtilization)
+	}
+	if gm.Unified5hReset == nil || gp.Unified5hReset == nil || !gm.Unified5hReset.Equal(*gp.Unified5hReset) {
+		t.Errorf("Unified5hReset differs: merge=%v put=%v", gm.Unified5hReset, gp.Unified5hReset)
+	}
+}
+
 func TestStore_getUnknownReturnsEmptySnapshot(t *testing.T) {
 	st := NewStore()
 	got := st.Get("never-recorded")

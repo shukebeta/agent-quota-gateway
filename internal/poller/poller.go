@@ -150,7 +150,10 @@ func (p *Poller) pollAll(ctx context.Context) {
 			fmt.Fprintf(p.logOut, "poller[%s]: %s poll failed: %v\n", name, prov.name, err)
 			continue
 		}
-		p.store.Put(b.QuotaKey(), snap)
+		// Merge, not Put: a poll response may omit a window (e.g. z.ai with
+		// no TIME_LIMIT, or NextResetTime 0), so a partial snapshot must not
+		// blank the previously-cached reset for the absent window (issue #163).
+		p.store.Merge(b.QuotaKey(), snap)
 		// Mirror the observer path: a successful poll is the first local
 		// evidence this pool has traffic-shaped state for the nick, so
 		// un-suppress the cross-pool snapshot for it (issue #111).

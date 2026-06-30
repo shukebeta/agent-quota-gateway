@@ -1083,10 +1083,11 @@ func keysOf(m map[string]quota.Snapshot) []string {
 }
 
 // runObserver is a test-local mirror of the run() observer closure: it
-// extracts the snapshot from resp and Puts it under the resolved backend's
+// extracts the snapshot from resp and Merges it under the resolved backend's
 // quota key iff hasQuotaWindow reports true. Mirrors the production change
-// in #121. The test-file mkObserver helper above keeps its HasData()
-// semantics per the issue's explicit non-goal.
+// in #121 (the hasQuotaWindow gate) and #163 (Merge over Put). The test-file
+// mkObserver helper above keeps its HasData() semantics per the issue's
+// explicit non-goal.
 func runObserver(store *quota.Store) proxy.ResponseObserver {
 	return func(resp *http.Response) {
 		snap := quota.Extract(resp)
@@ -1099,7 +1100,7 @@ func runObserver(store *quota.Store) proxy.ResponseObserver {
 				key = b.QuotaKey()
 			}
 		}
-		store.Put(key, snap)
+		store.Merge(key, snap)
 	}
 }
 
