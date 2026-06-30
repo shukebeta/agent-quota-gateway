@@ -342,6 +342,12 @@ func TestProxy_normalizeLeadingV1(t *testing.T) {
 		// 7. Non-root upstream: the operator's base path is preserved and
 		// no /v1 rule fires — behaviour identical to today.
 		{"non_root_unchanged", "/anthropic", "/v1/messages", "/anthropic/v1/messages"},
+		// 9. Segment-aware boundary: a leading token that merely starts
+		// with "v1" is not the /v1 segment, so it gains the prefix rather
+		// than collapsing. "v1beta" is synthetic (no Anthropic-compat
+		// surface serves it today); the case pins the boundary the design
+		// depends on (issue #157) against a future over-broad prefix check.
+		{"native_v1beta_boundary", "", "/v1beta/x", "/v1/v1beta/x"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
