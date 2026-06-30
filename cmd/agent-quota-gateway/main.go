@@ -189,7 +189,10 @@ func run(configFlag string) error {
 				pools.MarkLocalSnapshot(b.Pool, b.Nick)
 			}
 		}
-		store.Put(key, snap)
+		// Merge, not Put: a response reports only the windows it touched, so
+		// a window absent from this response must not blank the reset it
+		// taught us last time (issue #163).
+		store.Merge(key, snap)
 	}
 
 	// The pools' ModifyResponse hook runs after the observer: it dispatches
