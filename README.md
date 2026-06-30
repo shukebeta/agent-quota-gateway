@@ -1030,7 +1030,7 @@ upstream response did not carry the corresponding header):
 
 ```json
 {
-  "backend": "auto/a",
+  "backend": "a",
   "unified_status": "allowed",
   "unified_reset": "2026-06-13T13:30:00Z",
   "unified_representative_claim": "five_hour",
