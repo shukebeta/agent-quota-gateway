@@ -36,14 +36,15 @@ func TestLoad_missingAddedPoolsIsBackwardCompatible(t *testing.T) {
 }
 
 // TestLoad_roundTripsAddedPools proves added_pools survives a marshal/Load
-// round-trip with its base_url intact.
+// round-trip as a set of runtime pool names (post-#172, AddedPoolSpec carries
+// no fields — a runtime pool is a pure named marker).
 func TestLoad_roundTripsAddedPools(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
 
 	data, err := json.Marshal(GatewayState{
 		AddedPools: map[string]auto.AddedPoolSpec{
-			"rt": {BaseURL: "https://rt.example"},
+			"rt": {},
 		},
 	})
 	if err != nil {
@@ -57,12 +58,28 @@ func TestLoad_roundTripsAddedPools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	spec, ok := got.AddedPools["rt"]
-	if !ok {
+	if _, ok := got.AddedPools["rt"]; !ok {
 		t.Fatalf("added_pools missing rt after round-trip: %+v", got.AddedPools)
 	}
-	if spec.BaseURL != "https://rt.example" {
-		t.Errorf("rt base_url=%q, want https://rt.example", spec.BaseURL)
+}
+
+// TestLoad_legacyAddedPoolBaseURLIsIgnored proves a pre-#172 state file whose
+// added_pools entries still carry a "base_url" field loads cleanly — Go's
+// decoder ignores the now-unknown field. No migration, no version bump
+// (issue #172 acceptance criterion).
+func TestLoad_legacyAddedPoolBaseURLIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	legacy := `{"added_pools":{"legacy":{"base_url":"https://legacy.example"}},"pools":{}}`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := got.AddedPools["legacy"]; !ok {
+		t.Errorf("legacy runtime pool lost: %+v", got.AddedPools)
 	}
 }
 
@@ -147,9 +164,10 @@ func TestMarkDirty_coalesces(t *testing.T) {
 }
 
 // stateWith returns a GatewayState carrying an identifiable added pool so a
-// flushed file can be distinguished from empty.
-func stateWith(base string) GatewayState {
-	return GatewayState{AddedPools: map[string]auto.AddedPoolSpec{"rt": {BaseURL: base}}}
+// flushed file can be distinguished from empty. The marker is the presence of
+// the "rt" key — post-#172 the AddedPoolSpec carries no fields.
+func stateWith(_ string) GatewayState {
+	return GatewayState{AddedPools: map[string]auto.AddedPoolSpec{"rt": {}}}
 }
 
 // waitForFile polls for path to appear, failing the test if it never does.
@@ -184,8 +202,8 @@ func TestRun_flushesAfterDebounce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.AddedPools["rt"].BaseURL != "https://debounce.example" {
-		t.Errorf("flushed state mismatch: %+v", got)
+	if _, ok := got.AddedPools["rt"]; !ok {
+		t.Errorf("flushed state missing rt added pool: %+v", got.AddedPools)
 	}
 }
 
@@ -213,8 +231,8 @@ func TestRun_finalFlushOnShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.AddedPools["rt"].BaseURL != "https://shutdown.example" {
-		t.Errorf("final-flush state mismatch: %+v", got)
+	if _, ok := got.AddedPools["rt"]; !ok {
+		t.Errorf("final-flush state missing rt added pool: %+v", got.AddedPools)
 	}
 }
 

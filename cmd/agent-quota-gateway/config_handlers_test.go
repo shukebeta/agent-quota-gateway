@@ -88,13 +88,14 @@ func TestConfigEndpoint_redactsCredentials(t *testing.T) {
 
 // TestCreatePoolEndpoint drives POST /_gateway/pool: a valid request returns
 // 201 with the normalized pool name, the pool then surfaces in GET
-// /_gateway/config, and a duplicate name returns 409.
+// /_gateway/config, and a duplicate name returns 409. base_url is no longer
+// a create-pool field (issue #172).
 func TestCreatePoolEndpoint(t *testing.T) {
 	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
 	srv := configMux(t, loadPools(t))
 
 	resp, err := http.Post(srv.URL+"/_gateway/pool", "application/json",
-		strings.NewReader(`{"name":"New_Pool","base_url":"https://new.example"}`))
+		strings.NewReader(`{"name":"New_Pool"}`))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -118,12 +119,24 @@ func TestCreatePoolEndpoint(t *testing.T) {
 		t.Errorf("new-pool not in config view: %+v", got)
 	}
 
+	// A pre-issue-#172 client that still sends base_url is accepted (extra
+	// field is ignored by the decoder) — back-compat assertion.
+	resp, err = http.Post(srv.URL+"/_gateway/pool", "application/json",
+		strings.NewReader(`{"name":"legacy-client","base_url":"https://ignored.example"}`))
+	if err != nil {
+		t.Fatalf("post legacy: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("legacy-client (with base_url) status=%d, want 201 (base_url should be ignored)", resp.StatusCode)
+	}
+
 	// Duplicate name → 409.
-	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"new-pool","base_url":"https://x.example"}`, http.StatusConflict)
-	// Missing base_url → 400.
-	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"another"}`, http.StatusBadRequest)
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"new-pool"}`, http.StatusConflict)
+	// Empty name → 400.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":""}`, http.StatusBadRequest)
 	// Collision with an env pool → 409.
-	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"auto","base_url":"https://x.example"}`, http.StatusConflict)
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"auto"}`, http.StatusConflict)
 }
 
 // TestDisableEnableEndpoints drives the disable/enable endpoints and verifies

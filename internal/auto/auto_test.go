@@ -1902,6 +1902,61 @@ func TestRuntimeConfig_loadDropsUnknownNick(t *testing.T) {
 	}
 }
 
+// TestRuntimeConfig_loadDropsAddedMemberWithEmptyBaseURL proves that
+// loadRuntimeConfig refuses to restore an added member whose persisted
+// BaseURL is empty, with a clear logged error — the safety net that replaces
+// Controller.defaultBaseURL's removal (issue #172). The member is dropped
+// (not silently misrouted); the controller continues to boot.
+func TestRuntimeConfig_loadDropsAddedMemberWithEmptyBaseURL(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+
+	cfg := PoolRuntimeConfig{
+		AddedMembers: map[string]AddedMember{
+			"good": {Credential: "cred-good", BaseURL: "https://good.example"},
+			"bad":  {Credential: "cred-bad", BaseURL: ""}, // corrupted state
+		},
+	}
+	c.loadRuntimeConfig(cfg)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.addedMembers["good"]; !ok {
+		t.Errorf("good member not restored: addedMembers=%v", c.addedMembers)
+	}
+	if _, ok := c.addedMembers["bad"]; ok {
+		t.Errorf("bad member (empty base_url) was restored; want dropped")
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "refusing to restore") || !strings.Contains(logs, "bad") {
+		t.Errorf("expected loud log about dropped bad member, got: %q", logs)
+	}
+}
+
+// TestAddMember_newNickBrandNewPoolRequiresBaseURL proves the acceptance
+// criterion (issue #172): a brand-new pool with no static members and a
+// genuinely new nick added without an explicit base_url returns 400 with the
+// existing message text — the same error an AddMember on a static-member-less
+// pool returned pre-#172, just reached one step sooner (the pool-default
+// fallback is gone).
+func TestAddMember_newNickBrandNewPoolRequiresBaseURL(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+	if status, err := p.AddPool("fresh", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: status=%d err=%v, want 201", status, err)
+	}
+	status, err := p.AddMember("fresh", "brand-new-nick", "cred-bn", "", nil)
+	if status != http.StatusBadRequest || err == nil {
+		t.Fatalf("AddMember(new-nick, no-baseurl) on brand-new pool: status=%d err=%v, want 400", status, err)
+	}
+	if !strings.Contains(err.Error(), "base_url is required when pool has no static members") {
+		t.Errorf("error text=%q, want it to contain %q", err.Error(), "base_url is required when pool has no static members")
+	}
+}
+
 // TestRuntimeConfig_concurrentMutation proves that SetPriority and
 // SetMemberDisabled are safe under concurrent ResolveAuto (no races).
 func TestRuntimeConfig_concurrentMutation(t *testing.T) {
@@ -2174,7 +2229,7 @@ func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
 	// Create a runtime pool and runtime-add "shared" to it (the same
 	// shape the issue's UI scenario uses). "shared" already exists in
 	// pool ONE, so the credential resolves from there.
-	if status, err := p.AddPool("rt", "https://rt.example", ""); status != http.StatusCreated || err != nil {
+	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool rt: status=%d err=%v, want 201", status, err)
 	}
 	if status, err := p.AddMember("rt", "shared", "", "", nil); status != http.StatusOK || err != nil {

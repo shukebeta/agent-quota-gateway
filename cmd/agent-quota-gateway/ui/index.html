@@ -897,8 +897,9 @@
     var hint = document.createElement('p');
     hint.className = 'addsub-hint';
     hint.textContent = 'Choose a target pool, or pick "New pool…" to create a ' +
-      'runtime plain pool (name + base_url required) — a nick is optional there ' +
-      'and, if given, is added as the pool’s first member.';
+      'runtime plain pool (name required) — a nick is optional there and, ' +
+      'if given, is added as the pool’s first member (base_url is required ' +
+      'for a genuinely new nick).';
     section.appendChild(hint);
 
     var form = document.createElement('form');
@@ -909,9 +910,8 @@
     var base = mkInput('text', 'base_url', 'base_url (optional)');
     var cred = mkInput('password', 'credential', 'credential (optional)');
 
-    // New-pool fields, revealed only when NEW_POOL is selected.
+    // New-pool field, revealed only when NEW_POOL is selected.
     var poolName = mkInput('text', 'pool_name', 'new pool name');
-    var poolBase = mkInput('text', 'pool_base_url', 'new pool base_url');
 
     var pool = document.createElement('select');
     pool.setAttribute('data-field', 'pool');
@@ -931,15 +931,13 @@
     form.appendChild(cred);
     form.appendChild(pool);
     form.appendChild(poolName);
-    form.appendChild(poolBase);
 
-    // toggleNewPool reveals/hides the new-pool fields and adjusts the nick
+    // toggleNewPool reveals/hides the new-pool field and adjusts the nick
     // placeholder (nick is optional when creating a pool). Called on build and
     // on every selector change so the zero-pool case starts already revealed.
     function toggleNewPool() {
       var creating = pool.value === NEW_POOL;
       poolName.style.display = creating ? '' : 'none';
-      poolBase.style.display = creating ? '' : 'none';
       nick.placeholder = creating ? 'nick (optional)' : 'nick';
     }
     pool.addEventListener('change', toggleNewPool);
@@ -954,7 +952,7 @@
       ev.preventDefault();
       addSubscription({
         nick: nick, base: base, cred: cred, pool: pool,
-        poolName: poolName, poolBase: poolBase,
+        poolName: poolName,
       });
     });
 
@@ -1113,10 +1111,8 @@
     // it to "plain" (the only supported value).
     if (pool === NEW_POOL) {
       var pName = (fields.poolName.value || '').trim();
-      var pBase = (fields.poolBase.value || '').trim();
       if (!pName) { showBanner('Create pool failed: pool name is required'); return; }
-      if (!pBase) { showBanner('Create pool failed: pool base_url is required'); return; }
-      postJSON('/_gateway/pool', { name: pName, base_url: pBase }).then(function (r) {
+      postJSON('/_gateway/pool', { name: pName }).then(function (r) {
         if (!r || !r.ok) {
           // Surfaces 409 (duplicate name) / 400 (invalid input) via showBanner.
           return refreshAfter(r, 'Failed to create pool');
@@ -1124,7 +1120,6 @@
         // Use the server-normalized pool name as the member target.
         var created = (r.body && r.body.pool) || pName;
         fields.poolName.value = '';
-        fields.poolBase.value = '';
         if (!nick) {
           // Pool-only create: refresh so the new pool joins the list.
           return refreshAfter(r, 'Failed to create pool');

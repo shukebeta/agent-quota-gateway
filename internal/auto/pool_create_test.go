@@ -1,6 +1,7 @@
 package auto
 
 import (
+	"encoding/json"
 	"net/http"
 	"sync"
 	"testing"
@@ -27,7 +28,7 @@ func TestAddPool_createsPlainPool(t *testing.T) {
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
 
-	if status, err := p.AddPool("New_Pool", "https://new.example", ""); status != http.StatusCreated || err != nil {
+	if status, err := p.AddPool("New_Pool", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool: status=%d err=%v, want 201", status, err)
 	}
 	if !poolNames(t, p)["new-pool"] {
@@ -37,16 +38,17 @@ func TestAddPool_createsPlainPool(t *testing.T) {
 		t.Errorf("new pool has members %v, want empty", got)
 	}
 
-	// Add-member works immediately, with base_url omitted (pool default used).
-	if status, err := p.AddMember("new-pool", "a", "cred-a", "", nil); status != http.StatusOK || err != nil {
+	// Add-member works immediately. base_url is supplied explicitly because a
+	// brand-new pool has no default to fall back to (issue #172).
+	if status, err := p.AddMember("new-pool", "a", "cred-a", "https://a.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember after AddPool: status=%d err=%v, want 200", status, err)
 	}
 	am, ok := addedMember(t, p, "new-pool", "a")
 	if !ok {
 		t.Fatalf("member a not added to new-pool")
 	}
-	if am.BaseURL != "https://new.example" {
-		t.Errorf("member base_url=%q, want pool default https://new.example", am.BaseURL)
+	if am.BaseURL != "https://a.example" {
+		t.Errorf("member base_url=%q, want explicit https://a.example", am.BaseURL)
 	}
 }
 
@@ -56,7 +58,7 @@ func TestAddPool_conflictEnvPool(t *testing.T) {
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	if status, err := p.AddPool("src", "https://x.example", "plain"); status != http.StatusConflict || err == nil {
+	if status, err := p.AddPool("src", "plain"); status != http.StatusConflict || err == nil {
 		t.Fatalf("AddPool env collision: status=%d err=%v, want 409", status, err)
 	}
 }
@@ -67,49 +69,49 @@ func TestAddPool_conflictRuntimePool(t *testing.T) {
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	if status, err := p.AddPool("dup", "https://x.example", ""); status != http.StatusCreated || err != nil {
+	if status, err := p.AddPool("dup", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool first: status=%d err=%v, want 201", status, err)
 	}
-	if status, err := p.AddPool("dup", "https://y.example", ""); status != http.StatusConflict || err == nil {
+	if status, err := p.AddPool("dup", ""); status != http.StatusConflict || err == nil {
 		t.Fatalf("AddPool duplicate: status=%d err=%v, want 409", status, err)
 	}
 }
 
-// TestAddPool_rejectsBadInput proves missing/invalid base_url and unsupported
-// mode are rejected with 400.
+// TestAddPool_rejectsBadInput proves an empty name and an unsupported mode are
+// rejected with 400. (base_url is no longer a create-pool field — see
+// issue #172 / AddPool signature; URL validation lives in AddMember.)
 func TestAddPool_rejectsBadInput(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
 	cases := []struct {
-		name, baseURL, mode string
+		name, mode string
 	}{
-		{"a", "", "plain"},                     // missing base_url
-		{"b", "not-a-url", "plain"},            // invalid base_url (no scheme/host)
-		{"c", "https://x.example", "balanced"}, // unsupported mode
-		{"", "https://x.example", "plain"},     // empty name
+		{"a", "balanced"}, // unsupported mode
+		{"", "plain"},     // empty name
 	}
 	for _, tc := range cases {
-		if status, err := p.AddPool(tc.name, tc.baseURL, tc.mode); status != http.StatusBadRequest || err == nil {
-			t.Errorf("AddPool(%q,%q,%q): status=%d err=%v, want 400", tc.name, tc.baseURL, tc.mode, status, err)
+		if status, err := p.AddPool(tc.name, tc.mode); status != http.StatusBadRequest || err == nil {
+			t.Errorf("AddPool(%q,%q): status=%d err=%v, want 400", tc.name, tc.mode, status, err)
 		}
 	}
 }
 
 // TestAddPool_persistRoundTrip proves a runtime pool round-trips through
-// PersistAddedPools / LoadAddedPools as a clean slate (no members), excludes
-// env pools from the persisted set, and that the reloaded pool's default
-// base_url backs a credential-optional add.
+// PersistAddedPools / LoadAddedPools as a clean slate (no members, no base_url
+// — the pool is a pure named container post-#172), excludes env pools from the
+// persisted set, and that a cross-pool add to the reloaded pool resolves the
+// base_url the way any other pool would (not via a pool default).
 func TestAddPool_persistRoundTrip(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	if status, err := p.AddPool("rt", "https://rt.example", ""); status != http.StatusCreated || err != nil {
+	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool: status=%d err=%v", status, err)
 	}
-	if status, err := p.AddMember("rt", "a", "cred-a", "", nil); status != http.StatusOK || err != nil {
+	if status, err := p.AddMember("rt", "a", "cred-a", "https://a.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember: status=%d err=%v", status, err)
 	}
 
@@ -117,12 +119,8 @@ func TestAddPool_persistRoundTrip(t *testing.T) {
 	if _, ok := specs["src"]; ok {
 		t.Errorf("PersistAddedPools included env pool src: %v", specs)
 	}
-	spec, ok := specs["rt"]
-	if !ok {
+	if _, ok := specs["rt"]; !ok {
 		t.Fatalf("PersistAddedPools missing runtime pool rt: %v", specs)
-	}
-	if spec.BaseURL != "https://rt.example" {
-		t.Errorf("persisted base_url=%q, want https://rt.example", spec.BaseURL)
 	}
 
 	// Re-instantiate into a fresh Pools (same env registry).
@@ -140,13 +138,21 @@ func TestAddPool_persistRoundTrip(t *testing.T) {
 	// Persisting state over an empty re-instantiated pool must not panic.
 	_ = p2.PersistState()
 
-	// The reloaded pool's default base_url backs a credential-optional add.
-	if status, err := p2.AddMember("rt", "b", "cred-b", "", nil); status != http.StatusOK || err != nil {
-		t.Fatalf("AddMember to reloaded rt: status=%d err=%v", status, err)
+	// A pre-change state file whose AddedPoolSpec still carries a "base_url"
+	// field must load cleanly — Go's decoder ignores the unknown field
+	// (issue #172 acceptance criterion: backward-compatible read). The test
+	// round-trips through JSON so the decoder is actually exercised.
+	legacy := []byte(`{"legacy": {"base_url": "https://legacy.example"}}`)
+	var legacySpecs map[string]AddedPoolSpec
+	if err := json.Unmarshal(legacy, &legacySpecs); err != nil {
+		t.Fatalf("unmarshal legacy state: %v", err)
 	}
-	am, ok := addedMember(t, p2, "rt", "b")
-	if !ok || am.BaseURL != "https://rt.example" {
-		t.Errorf("reloaded pool default base_url not applied: ok=%v am=%+v", ok, am)
+	if _, ok := legacySpecs["legacy"]; !ok {
+		t.Fatalf("legacy spec lost: %v", legacySpecs)
+	}
+	p2.LoadAddedPools(legacySpecs)
+	if !poolNames(t, p2)["legacy"] {
+		t.Errorf("legacy runtime pool not re-instantiated from pre-change state shape")
 	}
 }
 
@@ -161,16 +167,16 @@ func TestRuntimePool_stickyPreservedAcrossRestart(t *testing.T) {
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	if status, err := p.AddPool("rt", "https://rt.example", ""); status != http.StatusCreated || err != nil {
+	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool: status=%d err=%v", status, err)
 	}
-	if status, err := p.AddMember("rt", "a", "cred-a", "", nil); status != http.StatusOK || err != nil {
+	if status, err := p.AddMember("rt", "a", "cred-a", "https://a.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember a: status=%d err=%v", status, err)
 	}
 	if _, _, known, _ := p.Route("rt"); !known {
 		t.Fatalf("Route(rt) after AddMember a: known=false")
 	}
-	if status, err := p.AddMember("rt", "b", "cred-b", "", nil); status != http.StatusOK || err != nil {
+	if status, err := p.AddMember("rt", "b", "cred-b", "https://b.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember b: status=%d err=%v", status, err)
 	}
 	// "a" is the active sticky; adding "b" must not switch it.
@@ -204,17 +210,16 @@ func TestAddPool_loadAddedPoolsDropsEnvCollision(t *testing.T) {
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	// "src" is env-defined; a stale runtime spec for it must not overwrite it.
-	p.LoadAddedPools(map[string]AddedPoolSpec{"src": {BaseURL: "https://stale.example"}})
-	c, ok := p.controller("src")
-	if !ok {
+	// "src" is env-defined; a stale runtime spec for it must not register a
+	// second controller — env wins, and the original env controller is
+	// untouched (no defaultBaseURL field exists post-#172).
+	p.LoadAddedPools(map[string]AddedPoolSpec{"src": {}})
+	if _, ok := p.controller("src"); !ok {
 		t.Fatalf("env pool src missing")
 	}
-	c.mu.Lock()
-	got := c.defaultBaseURL
-	c.mu.Unlock()
-	if got != "" {
-		t.Errorf("env pool src got runtime defaultBaseURL=%q, want unset", got)
+	// Only the one env controller for "src" should exist.
+	if got := p.controllersSnapshot(); len(got) != 1 {
+		t.Errorf("env pool src got duplicate controllers: %d (%v)", len(got), got)
 	}
 }
 
@@ -225,7 +230,7 @@ func TestAddPool_routeEmptyPoolExhausted(t *testing.T) {
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	if status, err := p.AddPool("empty", "https://e.example", ""); status != http.StatusCreated || err != nil {
+	if status, err := p.AddPool("empty", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool: status=%d err=%v", status, err)
 	}
 	_, _, known, exhausted := p.Route("empty")
@@ -259,7 +264,7 @@ func TestAddPool_concurrentWithReaders(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			name := "p" + string(rune('a'+i%26)) + string(rune('a'+i/26))
-			_, _ = p.AddPool(name, "https://x.example", "")
+			_, _ = p.AddPool(name, "")
 		}(i)
 	}
 	// Readers: exercise the map-ranging and single-lookup paths concurrently.
