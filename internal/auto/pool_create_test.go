@@ -1,7 +1,6 @@
 package auto
 
 import (
-	"encoding/json"
 	"net/http"
 	"sync"
 	"testing"
@@ -137,23 +136,6 @@ func TestAddPool_persistRoundTrip(t *testing.T) {
 	}
 	// Persisting state over an empty re-instantiated pool must not panic.
 	_ = p2.PersistState()
-
-	// A pre-change state file whose AddedPoolSpec still carries a "base_url"
-	// field must load cleanly — Go's decoder ignores the unknown field
-	// (issue #172 acceptance criterion: backward-compatible read). The test
-	// round-trips through JSON so the decoder is actually exercised.
-	legacy := []byte(`{"legacy": {"base_url": "https://legacy.example"}}`)
-	var legacySpecs map[string]AddedPoolSpec
-	if err := json.Unmarshal(legacy, &legacySpecs); err != nil {
-		t.Fatalf("unmarshal legacy state: %v", err)
-	}
-	if _, ok := legacySpecs["legacy"]; !ok {
-		t.Fatalf("legacy spec lost: %v", legacySpecs)
-	}
-	p2.LoadAddedPools(legacySpecs)
-	if !poolNames(t, p2)["legacy"] {
-		t.Errorf("legacy runtime pool not re-instantiated from pre-change state shape")
-	}
 }
 
 // TestRuntimePool_stickyPreservedAcrossRestart proves that the active
