@@ -410,16 +410,18 @@ type PoolRuntimeConfig struct {
 // AddedMember is a runtime-added pool member with credential.
 type AddedMember struct {
 	Credential string `json:"credential"`         // stored, never returned in config views
-	BaseURL    string `json:"base_url,omitempty"` // optional; pool default when empty
+	BaseURL    string `json:"base_url,omitempty"` // optional for a known nick (cross-pool resolved); always non-empty once persisted
 }
 
-// AddedPoolSpec is the persisted record of a runtime-created pool. It carries
-// only the pool's default base URL; members and routing state are persisted
-// separately (config / pools), so a re-instantiated pool is a clean slate.
-// It is exported so the persist package can embed it in GatewayState.
-type AddedPoolSpec struct {
-	BaseURL string `json:"base_url"`
-}
+// AddedPoolSpec is the persisted marker that a pool name was created at runtime
+// (POST /_gateway/pool) and so must be re-instantiated on restart. A runtime
+// pool owns no properties beyond its name — members and routing state are
+// persisted separately (config / pools), so a re-instantiated pool is a clean
+// slate. It carries no fields today but is retained as the persisted value type
+// so a pre-change state file whose entry still holds a "base_url" field decodes
+// cleanly (Go's decoder ignores the unknown field). Exported so the persist
+// package can embed it in GatewayState.
+type AddedPoolSpec struct{}
 
 // LoadPersistState applies previously persisted routing state to each pool's
 // controller. Called once at startup, before the server begins serving.
@@ -590,16 +592,14 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 		return http.StatusConflict, fmt.Errorf("nick %s already exists as a runtime-added member", normalized)
 	}
 
-	// Resolve base_url to a concrete value: an unresolved (new-nick) base_url
-	// falls back to the pool default so the persisted record is self-describing.
-	// The pool default is the first static member's URL, or — for a runtime
-	// pool with no static members — the URL the pool was created with.
+	// Resolve base_url to a concrete value so the persisted record is
+	// self-describing. An unresolved (new-nick) base_url falls back to the first
+	// static member's URL; a runtime pool with no static members has no default
+	// to borrow, so a genuinely new nick must supply base_url explicitly.
 	if resolvedURL == "" {
 		switch {
 		case len(c.nicks) > 0:
 			resolvedURL = c.backendAt(0).BaseURL
-		case c.defaultBaseURL != "":
-			resolvedURL = c.defaultBaseURL
 		default:
 			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no static members")
 		}
@@ -1033,12 +1033,13 @@ func (p *Pools) PersistState() map[string]PoolPersistState {
 }
 
 // AddPool creates a new plain pool at runtime and inserts it so the proxy can
-// route to it immediately. name is normalized; baseURL is required and
-// validated; mode defaults to "plain" and only "plain" is supported. The pool
-// starts empty (no members, no routing state) — members are added afterward
-// via AddMember. Returns (httpStatus, error) with a credential-free message;
-// (http.StatusCreated, nil) on success.
-func (p *Pools) AddPool(name, baseURL, mode string) (int, error) {
+// route to it immediately. name is normalized; mode defaults to "plain" and
+// only "plain" is supported. A runtime pool owns no base_url — it is a pure
+// named container, and each member resolves its own base_url via AddMember's
+// fallback chain. The pool starts empty (no members, no routing state) —
+// members are added afterward via AddMember. Returns (httpStatus, error) with
+// a credential-free message; (http.StatusCreated, nil) on success.
+func (p *Pools) AddPool(name, mode string) (int, error) {
 	normalized := backend.NormalizeName(name)
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("pool name is empty after normalization")
@@ -1048,13 +1049,6 @@ func (p *Pools) AddPool(name, baseURL, mode string) (int, error) {
 	}
 	if mode != "plain" {
 		return http.StatusBadRequest, fmt.Errorf("unsupported mode %q: only \"plain\" is supported", mode)
-	}
-	if baseURL == "" {
-		return http.StatusBadRequest, fmt.Errorf("base_url is required")
-	}
-	validURL, err := backend.ValidateBaseURL(baseURL)
-	if err != nil {
-		return http.StatusBadRequest, fmt.Errorf("invalid base_url: %w", err)
 	}
 
 	// An env-defined pool name is authoritative and can never be shadowed by a
@@ -1070,12 +1064,11 @@ func (p *Pools) AddPool(name, baseURL, mode string) (int, error) {
 	}
 
 	c := NewController(p.reg, normalized, -1, p.store, p.now, p.logOut)
-	c.defaultBaseURL = validURL
 	c.onMutate = p.onMutate
 	p.byPool[normalized] = c
 	c.notifyMutate() // persist the new pool (added_pools) promptly
 	if p.logOut != nil {
-		fmt.Fprintf(p.logOut, "auto: created runtime pool %s (base_url %s)\n", normalized, validURL)
+		fmt.Fprintf(p.logOut, "auto: created runtime pool %s\n", normalized)
 	}
 	return http.StatusCreated, nil
 }
@@ -1086,13 +1079,11 @@ func (p *Pools) AddPool(name, baseURL, mode string) (int, error) {
 func (p *Pools) PersistAddedPools() map[string]AddedPoolSpec {
 	snapshot := p.controllersSnapshot()
 	out := make(map[string]AddedPoolSpec, len(snapshot))
-	for name, c := range snapshot {
+	for name := range snapshot {
 		if p.reg.HasPool(name) {
 			continue
 		}
-		c.mu.Lock()
-		out[name] = AddedPoolSpec{BaseURL: c.defaultBaseURL}
-		c.mu.Unlock()
+		out[name] = AddedPoolSpec{}
 	}
 	return out
 }
@@ -1105,7 +1096,7 @@ func (p *Pools) PersistAddedPools() map[string]AddedPoolSpec {
 func (p *Pools) LoadAddedPools(specs map[string]AddedPoolSpec) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for rawName, spec := range specs {
+	for rawName := range specs {
 		name := backend.NormalizeName(rawName)
 		if name == "" {
 			continue
@@ -1120,7 +1111,6 @@ func (p *Pools) LoadAddedPools(specs map[string]AddedPoolSpec) {
 			continue
 		}
 		c := NewController(p.reg, name, -1, p.store, p.now, p.logOut)
-		c.defaultBaseURL = spec.BaseURL
 		// onMutate is wired later by SetOnMutate, which fans out over byPool.
 		p.byPool[name] = c
 	}
@@ -1152,13 +1142,6 @@ type Controller struct {
 	reg   *backend.Registry
 	pool  string
 	nicks []string // the pool's members, in stable sorted order; may be empty for a runtime-created pool
-
-	// defaultBaseURL is the pool-level default upstream for a runtime-created
-	// pool, which has no static member to borrow one from. It backs the
-	// credential-optional add path and added-member resolution when a member
-	// carries no explicit base_url. Empty for env-defined pools, which take
-	// their default from the first static member instead.
-	defaultBaseURL string
 
 	// store is the shared quota store. A member whose snapshot reports its
 	// unified window fully consumed (with a reset still ahead) is treated as
@@ -1984,6 +1967,16 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 		// Validate that the nick doesn't collide with a static member.
 		if c.indexOf(nick) >= 0 {
 			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping added member %q (collides with static member)\n", c.pool, nick)
+			continue
+		}
+		// A runtime-added member's base_url is always baked non-empty by
+		// AddMember; an empty value here means the state file was hand-edited
+		// or corrupted. Refuse to restore it rather than later routing a live
+		// request against an empty upstream URL (issue #172). The member is
+		// dropped loudly; any priority/sticky references to it fall through
+		// their own drop-with-warning validation below.
+		if am.BaseURL == "" {
+			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: refusing to restore added member %q: persisted base_url is empty (state file corrupted); dropping\n", c.pool, nick)
 			continue
 		}
 		// Restore with credential intact.
@@ -2831,12 +2824,13 @@ func (c *Controller) backendByNickLocked(nick string) (backend.Backend, bool) {
 	if am, ok := c.addedMembers[nick]; ok {
 		baseURL := am.BaseURL
 		if baseURL == "" {
-			// Fall back to the pool's default base URL: the first static
-			// member's, or the runtime pool's creation URL when there are none.
+			// Fall back to the first static member's URL as defense in depth.
+			// loadRuntimeConfig refuses to restore a member whose persisted
+			// base_url is empty, so this branch is unreachable in normal
+			// operation; it exists only to avoid a live request against an
+			// empty upstream URL for a hand-edited/corrupted state file.
 			if len(c.nicks) > 0 {
 				baseURL = c.backendAt(0).BaseURL
-			} else {
-				baseURL = c.defaultBaseURL
 			}
 		}
 		return backend.Backend{

@@ -633,7 +633,7 @@ the wrong tool.
 | Method & path | Effect |
 |---------------|--------|
 | `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
-| `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "base_url": "...", "mode": "plain"}` (`name` and `base_url` required, `mode` optional and defaults to `plain`). Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
+| `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required, `mode` optional and defaults to `plain`). A runtime pool is a pure named container with no pool-level base_url; each member resolves its own `base_url` via `AddMember`'s fallback chain. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
@@ -644,7 +644,7 @@ the wrong tool.
 ```bash
 curl http://127.0.0.1:8080/_gateway/config
 curl -X POST http://127.0.0.1:8080/_gateway/pool \
-  -d '{"name": "spare", "base_url": "https://api.anthropic.com"}'
+  -d '{"name": "spare"}'
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/priority -d '["b","a"]'
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/disable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/enable

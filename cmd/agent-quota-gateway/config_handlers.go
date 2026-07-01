@@ -25,10 +25,13 @@ func configHandler(pools *auto.Pools) http.HandlerFunc {
 }
 
 // createPoolRequest is the JSON request body for creating a runtime pool.
+// base_url is intentionally absent: a runtime pool is a pure named container
+// with no base_url property; each member resolves its own base_url via
+// AddMember's fallback chain. An extra `base_url` field in the request body is
+// silently ignored by the decoder, keeping pre-issue-#172 clients working.
 type createPoolRequest struct {
-	Name    string `json:"name"`     // required; normalized server-side
-	BaseURL string `json:"base_url"` // required; the pool's default upstream
-	Mode    string `json:"mode"`     // optional; defaults to "plain" (the only supported value)
+	Name string `json:"name"` // required; normalized server-side
+	Mode string `json:"mode"` // optional; defaults to "plain" (the only supported value)
 }
 
 // createPoolHandler serves POST /_gateway/pool — creates a plain pool at
@@ -42,7 +45,7 @@ func createPoolHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
-		status, err := pools.AddPool(req.Name, req.BaseURL, req.Mode)
+		status, err := pools.AddPool(req.Name, req.Mode)
 		if err != nil {
 			w.WriteHeader(status)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
